@@ -135,6 +135,47 @@ public sealed class StoreTests : IAsyncLifetime
         db.Functions.Add(new FunctionDefinition { Name = "same", Version = 1 });
         await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
     }
+    [Fact] public async Task Central_journal_and_alert_commit_with_terminal_failure()
+    {
+        await Add(1); var job = (await Claim())!;
+        await store.WriteLogAsync(job, "Information", "Business event", default);
+        Assert.True(await store.CompleteAsync(job, now.AddSeconds(1), "expected_failure", default));
+        Assert.False(await store.CompleteAsync(job, now.AddSeconds(1), "expected_failure", default));
+        await using var db = factory.CreateDbContext();
+        Assert.Equal("DeadLetter", (await db.Attempts.SingleAsync()).Outcome);
+        Assert.Single(await db.Alerts.ToListAsync());
+        Assert.Equal(3, await db.JobLogs.CountAsync());
+    }
+    [Fact] public async Task Expired_final_attempt_generates_alert_once()
+    {
+        await Add(1); await Claim(); await Claim(now.AddSeconds(31)); await Claim(now.AddSeconds(32));
+        await using var db = factory.CreateDbContext();
+        Assert.Equal(1, await db.Alerts.CountAsync()); Assert.Equal("DeadLetter", (await db.Attempts.SingleAsync()).Outcome);
+    }
+    [Fact] public async Task Alert_delivery_is_fenced_and_retries_are_bounded()
+    {
+        await Add(1); var job = (await Claim())!; await store.CompleteAsync(job, now, "failed", default);
+        var alerts = new AlertStore(factory);
+        var claims = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => alerts.ClaimAsync(now, default)));
+        var first = Assert.Single(claims, x => x is not null)!;
+        var second = (await alerts.ClaimAsync(now.AddSeconds(61), default))!;
+        Assert.False(await alerts.FinishAsync(first, true, now.AddSeconds(62), default));
+        var current = second; var at = now.AddSeconds(62);
+        while (current.DeliveryAttempts < 8)
+        {
+            Assert.True(await alerts.FinishAsync(current, false, at, default));
+            at = at.AddHours(2); current = (await alerts.ClaimAsync(at, default))!;
+        }
+        await alerts.FinishAsync(current, false, at, default);
+        await using var db = factory.CreateDbContext(); Assert.Equal("Parked", (await db.Alerts.SingleAsync()).DeliveryState);
+    }
+    [Fact] public async Task Operations_upgrade_is_repeatable_and_preserves_jobs()
+    {
+        var job = await Add(); await using var db = factory.CreateDbContext();
+        await db.Database.ExecuteSqlRawAsync("DROP TABLE \"Attempts\"; DROP TABLE \"JobLogs\"; DROP TABLE \"Alerts\";");
+        await SchemaUpgrade.ApplyOperationsAsync(db); await SchemaUpgrade.ApplyOperationsAsync(db);
+        Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.Attempts.ToListAsync());
+    }
     private sealed class TestFactory(DbContextOptions<RunnerDb> options) : IDbContextFactory<RunnerDb>
     { public RunnerDb CreateDbContext() => new(options); }
 }

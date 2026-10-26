@@ -10,5 +10,6 @@ public interface IJobHandler
 public sealed record JobContext(Guid JobId, string Payload, int Attempt)
 {
     /// <summary>Optional JSON result sink, bounded to 64 KiB by the worker.</summary>
+    public Func<string, string, CancellationToken, Task>? WriteLogAsync { get; init; }
     public Action<string>? ReportResult { get; init; }
 }

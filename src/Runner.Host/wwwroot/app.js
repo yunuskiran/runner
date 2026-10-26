@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null;
+let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null, resources = null, alertPage = 0;
 const esc = v => String(v ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 async function api(path, method='GET', body) {
   const r = await fetch('/api'+path, {method, headers:{'Content-Type':'application/json','X-Runner-Request':'1'}, body:body === undefined ? undefined : JSON.stringify(body)});
@@ -21,6 +21,7 @@ async function refresh() {
     $('page').textContent=`Page ${page+1}`; $('prev').disabled=page===0; $('next').disabled=jobs.length<50;
     $('schedule-list').innerHTML=schedules.length?schedules.map(s=>`<div class="schedule-item"><strong>${esc(s.type)}</strong><span>Every ${s.intervalSeconds}s · next ${esc(new Date(s.nextUtc).toLocaleString())}</span><button class="text" data-schedule="${s.id}">Delete</button></div>`).join(''):'<p>No recurring schedules.</p>';
     if(scriptingEnabled) await refreshFunctions();
+    await refreshOperations();
     $('updated').textContent='Updated '+new Date().toLocaleTimeString();
     if($('status').textContent.startsWith('Connecting'))status('Control plane connected · persistent job storage');
   } catch(e) {status(e.message,true);} finally {refreshing=false;}
@@ -29,13 +30,13 @@ async function act(fn, message) {try{await fn();status(message);await refresh();
 $('dispatch').onsubmit=e=>{e.preventDefault();act(()=>api('/jobs','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),maxAttempts:Number($('attempts').value),delaySeconds:Number($('delay').value),idempotencyKey:$('key').value||null}),'Job accepted.');};
 $('schedule').onsubmit=e=>{e.preventDefault();act(()=>api('/schedules','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),intervalSeconds:Number($('interval').value)}),'Schedule created.');};
 $('rows').onclick=e=>{const b=e.target.closest('[data-action]');if(!b)return;
-  if(b.dataset.action==='details') act(async()=>{const job=await api(`/jobs/${b.dataset.id}`);$('job-detail-content').textContent=JSON.stringify({...job,result:job.resultJson ? JSON.parse(job.resultJson) : null},null,2);$('job-detail').showModal();},'Job details loaded.');
+  if(b.dataset.action==='details') act(async()=>{const [job,attempts,logs]=await Promise.all([api(`/jobs/${b.dataset.id}`),api(`/jobs/${b.dataset.id}/attempts`),api(`/jobs/${b.dataset.id}/logs`)]);$('job-detail-content').textContent=JSON.stringify({...job,result:job.resultJson ? JSON.parse(job.resultJson) : null,attempts,logs},null,2);$('job-detail').showModal();},'Job details loaded.');
   else act(()=>api(`/jobs/${b.dataset.id}/${b.dataset.action}`,'POST'),'Operation accepted.');
 };
 $('schedule-list').onclick=e=>{const b=e.target.closest('[data-schedule]');if(b&&confirm('Delete this schedule?'))act(()=>api(`/schedules/${b.dataset.schedule}`,'DELETE'),'Schedule deleted.');};
 $('filter').onchange=()=>{page=0;refresh();}; $('prev').onclick=()=>{page=Math.max(0,page-1);refresh();}; $('next').onclick=()=>{page++;refresh();};
 $('logout').onclick=()=>act(async()=>{await api('/logout','POST');location.href='/login';},'Signed out.');
-api('/handlers').then(h=>{$('handler').innerHTML=h.map(x=>`<option>${esc(x)}</option>`).join('');return refresh();}).catch(e=>status(e.message,true));
+api('/handlers').then(h=>{$('handler').innerHTML=h.map(x=>`<option>${esc(x)}</option>`).join('');if(h.includes('sample.echo'))$('handler').value='sample.echo';return refresh();}).catch(e=>status(e.message,true));
 setInterval(refresh,5000);
 
 async function refreshFunctions() {
@@ -72,4 +73,29 @@ api('/scripting').then(async config=>{
   scriptingEnabled=config.enabled; $('function-workspace').hidden=!config.enabled;
   $('scripting-status').textContent=config.enabled?'Trusted operator mode · C# runs with host privileges. Only register reviewed code.':'Scripting is disabled. Set Scripting__Enabled=true on all workers to enable the registry.';
   if(config.enabled)await refreshFunctions();
+}).catch(e=>status(e.message,true));
+
+function connectionOptions() {
+  const connections=resources?.connections.filter(x=>x.provider===$('db-provider').value)||[];
+  $('db-connection').innerHTML=connections.map(c=>`<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('');
+  $('db-submit').disabled=!connections.length;
+}
+async function refreshOperations() {
+  const [report,alerts]=await Promise.all([api('/reports/summary?hours=24'),api(`/alerts?page=${alertPage}`)]);
+  $('report-rows').innerHTML=report.length?report.map(r=>`<tr><td>${esc(r.jobType)}</td><td>${esc(r.outcome)}</td><td>${r.count}</td><td>${Math.round(r.averageDurationMs)} ms</td></tr>`).join(''):'<tr><td colspan="4" class="empty">Reports appear as jobs execute.</td></tr>';
+  $('alert-list').innerHTML=alerts.length?alerts.map(a=>`<div class="alert-item"><div><strong>${esc(a.jobType)}</strong><small>${esc(a.errorCode)} · ${esc(new Date(a.createdUtc).toLocaleString())}</small><small>${esc(a.deliveryState)} · ${a.deliveryAttempts} delivery attempts${a.acknowledged?' · Acknowledged':''}</small></div><div>${a.acknowledged?'':`<button class="text" data-alert="${a.id}" data-alert-action="acknowledge">Acknowledge</button>`}${a.deliveryState==='Parked'?`<button class="text" data-alert="${a.id}" data-alert-action="redeliver">Retry delivery</button>`:''}</div></div>`).join(''):'<p>No alerts. Terminal failures are recorded here automatically.</p>';
+  $('alerts-page').textContent=`Page ${alertPage+1}`;$('alerts-prev').disabled=alertPage===0;$('alerts-next').disabled=alerts.length<50;
+}
+$('db-provider').onchange=connectionOptions;
+$('database-operation').onsubmit=e=>{e.preventDefault();act(()=>api('/jobs','POST',{type:'runner.database',maxAttempts:Number($('db-attempts').value),payload:{connection:$('db-connection').value,commandText:$('db-command').value,parameters:JSON.parse($('db-parameters').value),mode:$('db-mode').value,timeoutSeconds:Number($('db-timeout').value)}}),'Database command queued.');};
+$('process-operation').onsubmit=e=>{e.preventDefault();act(()=>api('/jobs','POST',{type:'runner.process',maxAttempts:Number($('process-attempts').value),payload:{application:$('process-application').value,arguments:JSON.parse($('process-arguments').value),timeoutSeconds:Number($('process-timeout').value)}}),'Application run queued.');};
+$('alert-list').onclick=e=>{const b=e.target.closest('[data-alert]');if(b)act(()=>api(`/alerts/${b.dataset.alert}/${b.dataset.alertAction}`,'POST'),'Alert updated.');};
+$('alerts-prev').onclick=()=>{alertPage=Math.max(0,alertPage-1);act(refreshOperations,'Alerts updated.');};
+$('alerts-next').onclick=()=>{alertPage++;act(refreshOperations,'Alerts updated.');};
+api('/resources').then(r=>{
+  resources=r;connectionOptions();
+  $('process-application').innerHTML=r.applications.map(a=>`<option value="${esc(a.name)}">${esc(a.name)}${a.acceptsArguments?' · arguments allowed':''}</option>`).join('');
+  $('process-submit').disabled=!r.applications.length;
+  $('resource-status').textContent=`${r.connections.length} database connections · ${r.applications.length} applications configured. Configure named resources securely in Operations settings.`;
+  $('alert-status').textContent=r.webhookConfigured?'Durable alert inbox · webhook delivery configured.':'Durable alert inbox · no webhook configured; alerts remain available here.';
 }).catch(e=>status(e.message,true));

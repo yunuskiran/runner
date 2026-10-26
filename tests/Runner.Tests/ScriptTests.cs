@@ -40,5 +40,19 @@ public sealed class ScriptTests
         using var compiler = new ScriptCompiler();
         var handler = new ScriptFunctionHandler(null!, compiler, Options.Create(new ScriptingOptions()));
         await Assert.ThrowsAsync<InvalidOperationException>(() => handler.ExecuteAsync(new JobContext(Guid.NewGuid(), "{}", 1), default));
+    }    [Fact] public async Task Apps_helper_uses_shared_process_failure_and_logging_policy()
+    {
+        using var compiler = new ScriptCompiler();
+        var applications = new ApplicationCommands(Options.Create(new OperationOptions
+        { Applications = new() { ["test"] = new() { FileName = "/usr/bin/python3", Arguments = ["-c", "import sys;print('script app output');sys.exit(9)"] } } }));
+        var messages = new List<string>();
+        var context = new JobContext(Guid.NewGuid(), "{}", 1)
+        { WriteLogAsync = (_, message, _) => { messages.Add(message); return Task.CompletedTask; } };
+        using var arguments = JsonDocument.Parse("{}");
+        var runner = compiler.Compile("return await Apps.RunAsync(\"test\", cancellationToken: CancellationToken);", default);
+        var globals = new ScriptGlobals(context.JobId, 1, arguments.RootElement, default) { Apps = new FunctionApplications(applications, context) };
+        var error = await Assert.ThrowsAsync<JobExecutionException>(() => runner(globals));
+        Assert.Equal("process_exit_9", error.Code); Assert.Contains(messages, x => x.Contains("script app output", StringComparison.Ordinal));
     }
+
 }

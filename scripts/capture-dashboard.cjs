@@ -45,6 +45,22 @@ const path=require('node:path');
       await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json','X-Runner-Request':'1'},body:JSON.stringify({type:'sample.echo',payload:{},delaySeconds:3600})});
     });
     await page.waitForTimeout(6000);
+    const resources=await page.evaluate(async()=>await (await fetch('/api/resources')).json());
+    for(const provider of ['Mssql','Postgres']) {
+      if(!resources.connections.some(c=>c.provider===provider))continue;
+      await page.locator('#db-provider').selectOption(provider);
+      await page.locator('#db-submit').click();
+      await page.waitForFunction(()=>document.getElementById('status').textContent==='Database command queued.');
+    }
+    if(resources.applications.some(a=>a.name==='echo')) {
+      await page.locator('#process-application').selectOption('echo');
+      await page.locator('#process-arguments').fill('["Report generated successfully"]');
+      await page.locator('#process-submit').click();
+      await page.waitForFunction(()=>document.getElementById('status').textContent==='Application run queued.');
+    }
+    await page.waitForTimeout(6000);
+    await page.locator('#operations').screenshot({path:path.join(output,'ready-operations.png')});
+    await page.locator('#reports').screenshot({path:path.join(output,'reporting-alerts.png')});
     // No credentials are rendered in the dashboard or included in these screenshots.
     await page.evaluate(()=>window.scrollTo(0,0));
     await page.screenshot({path:path.join(output,'dashboard.png')});

@@ -13,6 +13,10 @@ Real screenshots captured from the running application. The function registry is
 <details>
 <summary>C# function registry and persisted job results</summary>
 
+![Ready-to-run database and application operations](docs/images/ready-operations.png)
+
+![Central reports and alert inbox](docs/images/reporting-alerts.png)
+
 ![Database-backed C# function registry](docs/images/function-registry.png)
 
 ![Function execution result](docs/images/function-result.png)
@@ -84,6 +88,135 @@ public sealed class InvoiceHandler : IJobHandler
 
 Deploy the plugin with its dependency DLLs and `.deps.json` file. Configure an explicit allowlist such as `Plugins__0=plugins/YourPlugin.dll`; paths are relative to the executable directory. Do not load a separate copy of the shared `Runner.Contracts.dll` from the plugin directory. Use `Runner.SamplePlugin.csproj` as an example. Concrete handler types are created through scoped dependency injection and can receive framework services. Extend the host composition root to register additional services. Every worker in a deployment must use consistent `Type` identifiers; duplicate types prevent startup. Plugins require a rolling deployment to update; hot reload is not supported. Version payload contracts, and keep old handlers available while jobs for those versions remain queued. Plugins are responsible for validating their payloads.
 
+## Ready-to-run database and application jobs
+
+Use **Ready-to-run operations** in the dashboard to select a provider and named connection, bind SQL parameters, choose query/execute/scalar mode, or run a configured application with separate arguments. Both job types use the same leases, timeouts, retries, execution journal, results, reports, and terminal-failure alerts as plugins and scripts.
+
+### Named database connections
+
+Runner's own job storage remains SQLite or PostgreSQL. External business database commands support **PostgreSQL** (`Postgres`) and **Microsoft SQL Server** (`Mssql`). Configure resources outside job payloads and function source:
+
+```bash
+# Supply actual connection strings through your deployment's secret manager.
+export Operations__Connections__Warehouse__Provider=Postgres
+export Operations__Connections__Warehouse__ConnectionString="$WAREHOUSE_CONNECTION_STRING"
+export Operations__Connections__Billing__Provider=Mssql
+export Operations__Connections__Billing__ConnectionString="$BILLING_CONNECTION_STRING"
+```
+
+The dashboard filters connection names by provider. `/api/resources` returns names and providers, never connection strings. Configuration changes require restarting the participating hosts. Use least-privilege database identities, PostgreSQL `SSL Mode=VerifyFull`, and SQL Server encryption with a trusted server certificate in production. Worker/API instances must have consistent resource names; only workers need the executable installed or network access to the target database.
+
+Submit through `POST /api/jobs`:
+
+```json
+{
+  "type": "runner.database",
+  "payload": {
+    "connection": "Warehouse",
+    "commandText": "SELECT CAST(@customerId AS integer) AS customer_id",
+    "parameters": { "customerId": 42 },
+    "parameterTypes": { "customerId": "Int32" },
+    "mode": "query",
+    "timeoutSeconds": 30,
+    "maxRows": 100,
+    "commandType": "Text"
+  },
+  "maxAttempts": 1,
+  "idempotencyKey": "customer-report-001"
+}
+```
+
+Parameters are scalar JSON values bound with ADO.NET parameters, never interpolated into SQL. Optional `parameterTypes` use `DbType` names such as `Int32`, `Int64`, `Decimal`, `Guid`, `DateTime`, `DateTimeOffset`, `Binary` (base64), or `String`; specify a type for ambiguous/null parameters. Modes are `execute` (affected rows), `scalar`, and `query` (first result set). `commandType` supports `Text` and `StoredProcedure`; use provider-appropriate SQL/procedure semantics. SQL Server `GO` and psql client meta-commands are not supported.
+
+Command text is limited to 32 KiB, timeout to 1–300 seconds, parameters to 100, and query results to 1–1000 rows. Query results report `Truncated` when the row/approximately 48 KiB data budget is reached; the overall job result limit remains 64 KiB. This is a bounded reporting API, not a bulk export engine.
+
+For SQL writes and application side effects, retries can execute work again after a crash. The ready-operation forms default to one attempt. Only enable automatic retries when the operation is idempotent; use a business operation key/unique constraint or an outbox on the target system. API enqueue idempotency does not make an external SQL write exactly once. Commands are not transactionally coupled to Runner's job database.
+
+### Configured applications / executables
+
+Configure a fixed application alias on each execution host. This example uses a Linux executable; Windows workers can use an absolute path such as `C:\\Tools\\ReportGenerator.exe` instead:
+
+```json
+{
+  "Operations": {
+    "Applications": {
+      "ReportGenerator": {
+        "FileName": "/opt/company/report-generator",
+        "WorkingDirectory": "/var/lib/company/reports",
+        "Arguments": ["--format", "json"],
+        "AllowAdditionalArguments": false,
+        "Environment": { "REPORT_REGION": "eu" }
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "type": "runner.process",
+  "payload": {
+    "application": "ReportGenerator",
+    "arguments": [],
+    "timeoutSeconds": 300
+  },
+  "maxAttempts": 1
+}
+```
+
+Executables must be installed on the worker's OS; a Windows `.exe` does not run natively on a Linux container. Execution uses `ProcessStartInfo.ArgumentList` with `UseShellExecute=false`. It rejects arbitrary job-supplied executable paths and additional arguments unless the alias explicitly allows them. Do not allowlist a general shell/interpreter with unrestricted arguments unless that is an intentional trusted-operator capability.
+
+Child processes do not inherit the worker's environment credentials. Supply only required environment entries explicitly; Windows system/temp variables are preserved for OS operation. Both streams are drained with a limit of 8192 retained characters per stream; process output is persisted on normal process exit through the bounded job log sink, and successful runs also return exit code/output. Nonzero exit codes become `process_exit_N` failures. Cancellation, job timeout, or process timeout attempts to terminate the process tree. Partial output from a process interrupted by timeout/cancellation is not persisted. This is process management, not a security sandbox or a CPU/memory quota; detached descendants and OS permissions need deployment-level controls.
+
+### Business-only Roslyn helpers
+
+Functions can use the same services without reimplementing providers, process setup, logging, retry, reporting, or alert delivery:
+
+```csharp
+await Log.InfoAsync("Starting customer report", CancellationToken);
+var report = await Db.ExecuteAsync(
+    "Warehouse", "SELECT CAST(@customerId AS integer) AS customer_id",
+    new { customerId = Arguments.GetProperty("customerId").GetInt32() },
+    "query", CancellationToken);
+return report;
+```
+
+```csharp
+return await Apps.RunAsync("ReportGenerator", cancellationToken: CancellationToken);
+```
+
+`Apps` uses the same output logging and nonzero-exit failure policy as the ready process job. `Db` throws classified failures so the worker applies the normal retry/dead-letter policy. `Log.InfoAsync` and `Log.WarningAsync` are optional business messages; the worker records start/end, duration, outcome, and terminal alerts automatically for all job types. Source code remains trusted and can bypass these helpers; this is a programming convention, not a restriction on Roslyn's process privileges.
+
+## Central logging, reporting, and alerts
+
+Every new execution attempt is recorded in the shared Runner database with job ID, type, attempt number, worker, start/end, outcome, duration, and sanitized error code. Claim and completion records commit with ownership changes. A stale lease cannot finalize an attempt/result or add business logs. Lease recovery closes abandoned attempts; final-attempt crashes and terminal handler failures create durable alerts in the same transaction as dead-letter state. Pre-upgrade attempts are not backfilled.
+
+**Job details** includes attempt history and centralized logs from all workers. Lifecycle records are automatic; plugins can use `JobContext.WriteLogAsync`, and scripts use `Log`. Business messages are limited to 4000 retained characters and 200 entries per attempt; extra messages are dropped. Ready process stdout/stderr use the same sink. Avoid printing secrets, SQL parameter values, or sensitive business data. Infrastructure errors are classified without persisting raw connection strings or exception messages.
+
+Application logs use structured JSON console output and optionally OTLP logs alongside existing metrics/traces. Set `Telemetry__OtlpEnabled=true` and standard `OTEL_EXPORTER_OTLP_*` settings to send telemetry to your central collector (for example, an OpenTelemetry Collector forwarding to your organization's logging backend). Runner does not deploy that external backend.
+
+The dashboard reports attempts by job type/outcome over the last 24 hours and exports CSV. `/api/reports/summary?hours=24` and `/api/reports/summary.csv?hours=24` accept 1–720 hours; available history is bounded by retention. Reports count attempts, including retries, rather than unique jobs. Job logs and finished attempts follow `Runner__RetentionDays`. Dead-letter jobs and unacknowledged/undelivered alerts are retained for investigation.
+
+The **alert inbox** works without an external service. Optionally configure delivery:
+
+```bash
+export Alerts__WebhookUrl="$OPERATIONS_ALERT_WEBHOOK_URL"
+export Alerts__SigningKey="$OPERATIONS_ALERT_SIGNING_KEY"
+export Alerts__DeliveryEnabled=true
+```
+
+Only HTTPS endpoints are accepted in production; Development also permits loopback HTTP for tests. The URL is deployment-controlled, omitted from resource API responses, and redirects are disabled. The generic JSON event contains `id`, `jobId`, `jobType`, `errorCode`, and `createdUtc`; it excludes payloads, results, SQL, connection strings, and process arguments. Connect a receiver/bridge for email, Slack, or your incident system; their native payload formats are not implemented directly.
+
+Delivery uses a leased DB outbox across replicas, a 10-second request timeout, exponential retry delay, and at most eight attempts before parking. Network failures, non-2xx responses, and expired delivery leases can cause redelivery. Receivers must deduplicate by `X-Runner-Alert-Id`. With a signing key, verify `X-Runner-Signature` as lowercase hexadecimal HMAC-SHA256 over the exact request body. There is no exactly-once delivery guarantee. Acknowledgement marks investigation state independently of delivery. Parked deliveries can be retried from the dashboard; acknowledged alerts are eligible for retention deletion only after delivery or parking. Without a webhook, alerts remain pending in the inbox. Changing the configured endpoint affects pending delivery; drain or disable delivery before rotating destinations if needed.
+
+Existing databases must be backed up and upgraded with workers stopped:
+
+```bash
+dotnet Runner.Host.dll --upgrade-operations
+```
+
+This applies the version 2 function upgrade when needed and the version 3 attempt/log/alert tables, preserves existing jobs/functions, and records applied versions. It is safe to rerun. Fresh databases include the new tables; the development script handles bootstrap/upgrade. Use a separate DDL deployment identity, then run with a restricted DML identity.
+
 ## Database-registered C# functions (Roslyn)
 
 Enable scripting explicitly on **all** participating API and worker instances:
@@ -92,7 +225,7 @@ Enable scripting explicitly on **all** participating API and worker instances:
 Scripting__Enabled=true bash scripts/dev.sh
 ```
 
-The development script initializes a fresh database or applies the version 2 upgrade to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
+The development script initializes a fresh database or applies the version 2/3 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
 
 Use **C# function registry** in the dashboard to compile and register a named version, inspect compilation diagnostics, select the registered version, supply JSON arguments, and queue a run. Use **Details** in job activity to inspect the persisted JSON result. The registry supports pagination, viewing source, and enabling or disabling versions.
 
@@ -154,6 +287,13 @@ All `/api/*` requests require an operator cookie or `X-Runner-Key`. Mutations al
 
 | Method | Path | Operation |
 | --- | --- | --- |
+| GET | `/api/resources` | List safe resource metadata and webhook configuration status |
+| GET | `/api/jobs/{id}/logs?page=0` | List 100 centralized log entries per page |
+| GET | `/api/jobs/{id}/attempts` | Inspect up to 100 latest execution attempts |
+| GET | `/api/reports/summary`, `/api/reports/summary.csv` | Execution report by type/outcome |
+| GET | `/api/alerts?page=0` | List 50 alerts per page |
+| POST | `/api/alerts/{id}/acknowledge` | Acknowledge an incident |
+| POST | `/api/alerts/{id}/redeliver` | Requeue a parked webhook delivery |
 | GET | `/api/scripting` | Inspect whether scripting is enabled |
 | GET / POST | `/api/functions` | List up to 50 function versions per page or compile and register one |
 | GET | `/api/functions/{id}` | Inspect an immutable function version and its source |
@@ -183,6 +323,12 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 
 | Setting | Default / purpose |
 | --- | --- |
+| `Operations__Connections__<name>__Provider` | `Postgres` or `Mssql` for business commands; independent of Runner storage |
+| `Operations__Connections__<name>__ConnectionString` | Secret DSN, never stored in a job payload |
+| `Operations__Applications__<name>__FileName` | Allowlisted absolute executable path |
+| `Alerts__WebhookUrl` | Optional HTTPS alert receiver |
+| `Alerts__SigningKey` | Optional HMAC signing secret |
+| `Alerts__DeliveryEnabled` | true; disable outbound delivery while retaining the inbox |
 | `Scripting__Enabled` | `false`; opt in to trusted Roslyn execution on every worker/API instance |
 | `Storage__Provider` | `Sqlite` or `Postgres` |
 | `Storage__ConnectionString` | Local SQLite; supply a PostgreSQL DSN through a secret manager in production |
@@ -215,13 +361,13 @@ docker compose up --build -d
 
 Compose runs one initialization job after PostgreSQL passes its health check, then starts Runner. PostgreSQL's port is not published to the host; Runner binds only to 127.0.0.1. In production, place a TLS reverse proxy in front of Runner and prevent direct access to the application container. Set `Security__TrustedProxy` to the actual proxy IP. Production cookies require HTTPS; browser login will not work over plain HTTP. You can use loopback HTTP with an API key for health and API smoke checks.
 
-For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2 upgrade from the published directory with the correct provider and connection string:
+For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3 upgrade from the published directory with the correct provider and connection string:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-scripting
+dotnet Runner.Host.dll --upgrade-operations
 ```
 
-The upgrade adds the function registry and nullable job result column, preserves existing jobs and schedules, records schema version 2, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
+The upgrade adds the function registry, nullable job result column, execution journal, and alert outbox; it preserves existing jobs and schedules, records schema versions 2 and 3, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
 
 Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating the API key does not immediately revoke existing eight-hour cookies: immediate session revocation requires cookie key ring rotation or an additional authentication revocation mechanism. Built-in authentication has a single operator role; multi-user RBAC and audit requirements need an OIDC gateway and centralized audit integration. Restrict access before exposing the service to the public internet.
 
@@ -235,7 +381,11 @@ Start with a single machine and SQLite. For durable operation across multiple re
 dotnet test tests/Runner.Tests -c Release
 # This connection role needs CREATEDB to create and delete isolated test databases:
 TEST_POSTGRES='Host=localhost;Username=postgres;Password=...' dotnet test tests/Runner.Tests -c Release
+# Optional live business database checks (separate from Runner's own store):
+# TEST_DATABASE_POSTGRES and TEST_DATABASE_MSSQL select disposable PostgreSQL/SQL Server services.
+# With no bindings those two integration checks are explicitly skipped.
 python3 scripts/smoke.py
+SMOKE_SCRIPTING=true SMOKE_OPERATIONS=true python3 scripts/smoke.py
 # Use an empty database dedicated to testing; the smoke test does not delete it automatically.
 SMOKE_POSTGRES='Host=localhost;Database=runner_smoke;Username=postgres;Password=...' python3 scripts/smoke.py
 dotnet publish src/Runner.Host -c Release -o artifacts/publish
@@ -244,4 +394,4 @@ docker build -t runner:local .
 
 To regenerate the committed screenshots, start a local instance with scripting enabled and sample data, install Playwright separately from the application, and run `scripts/capture-dashboard.cjs`. It requires Chromium (default `/usr/bin/chromium`, override with `CHROMIUM_PATH`), `RUNNER_SCREENSHOT_URL` for the target instance, and a local operator key file (`RUNNER_KEY_FILE`, default `src/Runner.Host/data/operator.key`). The capture tool creates sample functions and jobs in that instance; use a disposable development database. It never renders or saves the operator key in an image.
 
-Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both database providers. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.
+Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both Runner storage providers and both business database command providers. SQL Server Developer is used only for development/testing, with test-only plaintext loopback connections; configure encryption and licensing appropriately for production. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.

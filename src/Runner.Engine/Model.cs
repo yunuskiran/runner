@@ -37,9 +37,17 @@ public sealed class RunnerDb(DbContextOptions<RunnerDb> options) : DbContext(opt
 {
     public DbSet<Job> Jobs => Set<Job>();
     public DbSet<Schedule> Schedules => Set<Schedule>();
+    public DbSet<ExecutionAttempt> Attempts => Set<ExecutionAttempt>();
+    public DbSet<JobLog> JobLogs => Set<JobLog>();
+    public DbSet<JobAlert> Alerts => Set<JobAlert>();
     public DbSet<FunctionDefinition> Functions => Set<FunctionDefinition>();
     protected override void OnModelCreating(ModelBuilder b)
     {
+        b.Entity<ExecutionAttempt>().HasIndex(x => new { x.JobId, x.StartedUtc });
+        b.Entity<ExecutionAttempt>().HasIndex(x => x.StartedUtc);
+        b.Entity<JobLog>().HasIndex(x => new { x.JobId, x.TimestampUtc });
+        b.Entity<JobAlert>().HasIndex(x => new { x.DeliveryState, x.NextDeliveryUtc });
+        b.Entity<JobAlert>().HasIndex(x => x.CreatedUtc);
         b.Entity<FunctionDefinition>().HasIndex(x => new { x.Name, x.Version }).IsUnique();
         b.Entity<FunctionDefinition>().Property(x => x.Name).HasMaxLength(120);
         b.Entity<FunctionDefinition>().Property(x => x.SourceHash).HasMaxLength(64);

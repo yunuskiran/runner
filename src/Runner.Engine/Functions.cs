@@ -30,6 +30,9 @@ public sealed class ScriptingOptions
 /// <summary>Trusted scripts execute with the host's process privileges. This is not a sandbox.</summary>
 public sealed class ScriptGlobals(Guid jobId, int attempt, JsonElement arguments, CancellationToken cancellationToken)
 {
+    public DatabaseCommands Db { get; init; } = null!;
+    public FunctionApplications Apps { get; init; } = null!;
+    public FunctionLog Log { get; init; } = null!;
     public Guid JobId { get; } = jobId;
     public int Attempt { get; } = attempt;
     public JsonElement Arguments { get; } = arguments;
@@ -87,7 +90,7 @@ public sealed class ScriptCompiler : IDisposable
 }
 
 public sealed class ScriptFunctionHandler(IDbContextFactory<RunnerDb> factory, ScriptCompiler compiler,
-    IOptions<ScriptingOptions> options) : IJobHandler
+    IOptions<ScriptingOptions> options, DatabaseCommands? database = null, ApplicationCommands? applications = null) : IJobHandler
 {
     public const string JobType = "runner.script";
     public string Type => JobType;
@@ -104,7 +107,7 @@ public sealed class ScriptFunctionHandler(IDbContextFactory<RunnerDb> factory, S
         if (!definition.Enabled) throw new InvalidOperationException("Function version is disabled");
         if (ScriptCompiler.Hash(definition.Source) != definition.SourceHash) throw new InvalidOperationException("Function source hash mismatch");
         var runner = compiler.Compile(definition.Source, ct);
-        var result = await runner(new ScriptGlobals(context.JobId, context.Attempt, arguments, ct), ct);
+        var result = await runner(new ScriptGlobals(context.JobId, context.Attempt, arguments, ct) { Db = database!, Apps = new FunctionApplications(applications!, context), Log = new FunctionLog(context) }, ct);
         ct.ThrowIfCancellationRequested();
         context.ReportResult?.Invoke(JsonSerializer.Serialize(result));
     }

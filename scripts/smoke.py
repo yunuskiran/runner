@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 """Black-box smoke test: launch a real host with isolated state, assert behavior, clean up."""
 import http.cookiejar, json, os, pathlib, re, secrets, socket, subprocess, tempfile, time, urllib.request, urllib.error
+import http.server, threading, hmac, hashlib
 root = pathlib.Path(__file__).resolve().parents[1]
 dotnet = os.environ.get('DOTNET_COMMAND', 'dotnet')
 with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
 base = f'http://127.0.0.1:{port}'
 key = secrets.token_hex(32)
+operations = os.environ.get('SMOKE_OPERATIONS', 'false').lower() == 'true'
+deliveries = []
+class AlertReceiver(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body=self.rfile.read(int(self.headers['Content-Length']))
+        expected=hmac.new(b'smoke-local-only',body,hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected,self.headers.get('X-Runner-Signature','')):
+            self.send_response(400);self.end_headers();return
+        deliveries.append(json.loads(body))
+        self.send_response(500 if len(deliveries)==1 else 204);self.end_headers()
+    def log_message(self,*args):pass
+receiver=http.server.ThreadingHTTPServer(('127.0.0.1',0),AlertReceiver) if operations else None
+if receiver: threading.Thread(target=receiver.serve_forever,daemon=True).start()
 with tempfile.TemporaryDirectory() as tmp:
     env = dict(os.environ, ASPNETCORE_ENVIRONMENT='Development', ASPNETCORE_URLS=base,
                Security__ApiKey=key, Security__KeyDirectory=tmp+'/keys', Storage__Initialize='true',
@@ -14,6 +28,12 @@ with tempfile.TemporaryDirectory() as tmp:
                Scripting__Enabled=os.environ.get('SMOKE_SCRIPTING', 'false'), Runner__LeaseSeconds='12', Runner__HeartbeatSeconds='2', Runner__Concurrency='2')
     if os.environ.get('SMOKE_POSTGRES'):
         env.update(Storage__Provider='Postgres', Storage__ConnectionString=os.environ['SMOKE_POSTGRES'])
+    if operations:
+        env.update(Operations__Applications__echo__FileName='/usr/bin/printf',Operations__Applications__echo__Arguments__0='%s',Operations__Applications__echo__AllowAdditionalArguments='true',
+                   Operations__Applications__fail__FileName='/usr/bin/python3',Operations__Applications__fail__Arguments__0='-c',Operations__Applications__fail__Arguments__1="import sys;print('central log');sys.exit(7)",
+                   Alerts__WebhookUrl=f'http://127.0.0.1:{receiver.server_port}/alerts',Alerts__SigningKey='smoke-local-only')
+        for provider,variable,name in [('Postgres','TEST_DATABASE_POSTGRES','postgres'),('Mssql','TEST_DATABASE_MSSQL','mssql')]:
+            if os.environ.get(variable):env.update({f'Operations__Connections__{name}__Provider':provider,f'Operations__Connections__{name}__ConnectionString':os.environ[variable]})
     log = open(tmp+'/host.log', 'w+')
     host = pathlib.Path(os.environ.get('SMOKE_HOST_DLL', root/'src/Runner.Host/bin/Release/net10.0/Runner.Host.dll')).resolve()
     working = host.parent if 'SMOKE_HOST_DLL' in os.environ else root/'src/Runner.Host'
@@ -47,7 +67,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert request('/api/jobs',headers={'X-Runner-Key':'bad'})[0]==401
         assert request('/api/jobs','POST',{},headers={'X-Runner-Request':''})[0]==400
         scripting = os.environ.get('SMOKE_SCRIPTING', 'false').lower() == 'true'
-        assert set(request('/api/handlers')[1]) == ({'sample.echo', 'runner.script'} if scripting else {'sample.echo'})
+        assert set(request('/api/handlers')[1]) == ({'sample.echo', 'runner.database', 'runner.process', 'runner.script'} if scripting else {'sample.echo', 'runner.database', 'runner.process'})
         assert request('/api/functions', auth=False)[0] == 401
         assert request('/api/scripting')[1]['enabled'] == scripting
         if not scripting: assert request('/api/functions')[0] == 404
@@ -79,6 +99,40 @@ with tempfile.TemporaryDirectory() as tmp:
             assert request('/api/schedules/'+scheduled['id'],'DELETE')[0]==204
             print('PASS: script registration, compile diagnostics, immutable version pinning, JSON results, disable/enable, scheduled scripts')
         assert request('/api/jobs','POST',{'type':'missing','payload':{}})[0]==400
+        if operations:
+            code,resources=request('/api/resources');assert code==200,resources
+            assert 'connectionString' not in json.dumps(resources)
+            assert request('/api/jobs','POST',{'type':'runner.process','payload':{'application':'/bin/sh'}})[0]==400
+            code,run=request('/api/jobs','POST',{'type':'runner.process','payload':{'application':'echo','arguments':['literal; $(no-shell)']}})
+            assert code==201,run
+            result=wait_job(run['id'],'Succeeded'); assert 'literal; $(no-shell)' in result['resultJson']
+            logs=request('/api/jobs/'+run['id']+'/logs')[1];assert any('literal; $(no-shell)' in row['message'] for row in logs)
+            assert request('/api/jobs/'+run['id']+'/attempts')[1][0]['outcome']=='Succeeded'
+            code,failed_process=request('/api/jobs','POST',{'type':'runner.process','payload':{'application':'fail'},'maxAttempts':1});assert code==201
+            wait_job(failed_process['id'],'DeadLetter')
+            deadline=time.time()+30
+            while time.time()<deadline:
+                alerts=request('/api/alerts')[1];alert=next((a for a in alerts if a['jobId']==failed_process['id']),None)
+                if alert and alert['deliveryState']=='Delivered':break
+                time.sleep(.3)
+            else:raise AssertionError('Alert retry/delivery did not complete')
+            assert alert['deliveryAttempts']==2,alert
+            assert request('/api/alerts/'+alert['id']+'/acknowledge','POST')[0]==204
+            assert deliveries[0]['id']==deliveries[1]['id']
+            for connection in resources['connections']:
+                code,query=request('/api/jobs','POST',{'type':'runner.database','payload':{'connection':connection['name'],'commandText':'SELECT CAST(@value AS integer) AS value','parameters':{'value':42},'parameterTypes':{'value':'Int32'},'mode':'query'}})
+                assert code==201,query
+                result=wait_job(query['id'],'Succeeded'); assert json.loads(result['resultJson'])['Rows'][0]['value']==42,result
+            report=request('/api/reports/summary')[1]
+            assert any(r['jobType']=='runner.process' and r['outcome']=='DeadLetter' for r in report),report
+            code,csv=request('/api/reports/summary.csv'); assert code==200 and 'runner.process' in csv
+            if scripting and resources['connections']:
+                code,function=request('/api/functions','POST',{'name':'helper.'+secrets.token_hex(8),'version':1,'source':f'await Log.InfoAsync("business event", CancellationToken); return await Db.ExecuteAsync("{resources["connections"][0]["name"]}", "SELECT @value AS value", new {{ value = 42 }}, "query", CancellationToken);'})
+                assert code==201,function
+                code,job=request('/api/jobs','POST',{'type':'runner.script','payload':{'functionId':function['id'],'arguments':{}}})
+                result=wait_job(job['id'],'Succeeded');assert json.loads(result['resultJson'])['Rows'][0]['value']==42
+                assert any(row['message']=='business event' for row in request('/api/jobs/'+job['id']+'/logs')[1])
+            print('PASS: ready database/process jobs, named resources, centralized logs, reports/CSV, durable signed webhook retry, acknowledgement, script business helpers')
         body={'type':'sample.echo','payload':{'delayMs':100},'idempotencyKey':'smoke-'+secrets.token_hex(8)}
         code, job=request('/api/jobs','POST',body); assert code==201,job
         assert request('/api/jobs','POST',body)[1]['id']==job['id']
@@ -124,3 +178,4 @@ with tempfile.TemporaryDirectory() as tmp:
         try: proc.wait(timeout=35)
         except subprocess.TimeoutExpired: proc.kill();proc.wait()
         log.close()
+        if receiver:receiver.shutdown();receiver.server_close()

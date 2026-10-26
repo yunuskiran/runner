@@ -1,3 +1,4 @@
+using OpenTelemetry.Logs;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.HttpOverrides;
 using System.Net;
@@ -20,6 +21,26 @@ using OpenTelemetry.Metrics;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddProblemDetails();
+builder.Logging.ClearProviders();
+builder.Logging.AddJsonConsole(o => { o.IncludeScopes = true; o.TimestampFormat = "O"; });
+builder.Logging.AddOpenTelemetry(o =>
+{
+    o.IncludeScopes = true; o.IncludeFormattedMessage = true;
+    if (builder.Configuration.GetValue<bool>("Telemetry:OtlpEnabled")) o.AddOtlpExporter();
+});
+builder.Services.AddOptions<OperationOptions>().BindConfiguration("Operations").Validate(o =>
+    o.Connections.All(c => c.Value.Provider is "Mssql" or "Postgres" && !string.IsNullOrWhiteSpace(c.Value.ConnectionString)),
+    "Configured connections must specify Mssql or Postgres and a connection string").ValidateOnStart();
+builder.Services.AddSingleton<DatabaseCommands>(); builder.Services.AddSingleton<ApplicationCommands>();
+builder.Services.AddScoped<DatabaseJobHandler>(); builder.Services.AddScoped<ProcessJobHandler>();
+builder.Services.AddScoped<Runner.Contracts.IJobHandler>(s => s.GetRequiredService<DatabaseJobHandler>());
+builder.Services.AddScoped<Runner.Contracts.IJobHandler>(s => s.GetRequiredService<ProcessJobHandler>());
+builder.Services.AddOptions<AlertOptions>().BindConfiguration("Alerts").Validate(o => string.IsNullOrEmpty(o.WebhookUrl) ||
+    (Uri.TryCreate(o.WebhookUrl, UriKind.Absolute, out var url) && (url.Scheme == "https" ||
+        (builder.Environment.IsDevelopment() && url.Scheme == "http" && url.IsLoopback))), "Webhook must be HTTPS (loopback HTTP allowed only in Development)").ValidateOnStart();
+builder.Services.AddSingleton<AlertStore>();
+builder.Services.AddHttpClient("runner-alerts").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false }).RemoveAllLoggers();
+builder.Services.AddHostedService<AlertDispatcher>();
 builder.Services.AddOpenTelemetry().ConfigureResource(r => r.AddService("runner"))
     .WithTracing(t => { t.AddSource("Runner").AddAspNetCoreInstrumentation();
         if (builder.Configuration.GetValue<bool>("Telemetry:OtlpEnabled")) t.AddOtlpExporter(); })
@@ -83,6 +104,12 @@ if (args.Contains("--schema"))
     await using var db = await factory.CreateDbContextAsync();
     Console.WriteLine(db.Database.GenerateCreateScript()); return;
 }
+if (args.Contains("--upgrade-operations"))
+{
+    await using var db = await factory.CreateDbContextAsync();
+    await SchemaUpgrade.ApplyOperationsAsync(db);
+    Console.WriteLine("Schema version 3 verified: centralized operations records are available."); return;
+}
 if (args.Contains("--upgrade-scripting"))
 {
     await using var db = await factory.CreateDbContextAsync();
@@ -129,7 +156,8 @@ app.MapGet("/health/live", () => Results.Ok(new { status = "alive" }));
 app.MapGet("/health/ready", async (CancellationToken ct) =>
 {
     try { await using var db = await factory.CreateDbContextAsync(ct); _ = await db.Jobs.AsNoTracking().Select(x => x.ResultJson).FirstOrDefaultAsync(ct);
-        _ = await db.Functions.AsNoTracking().AnyAsync(ct); return Results.Ok(new { status = "ready" }); }
+        _ = await db.Functions.AsNoTracking().AnyAsync(ct);
+        _ = await db.Attempts.AsNoTracking().AnyAsync(ct); _ = await db.JobLogs.AsNoTracking().AnyAsync(ct); _ = await db.Alerts.AsNoTracking().AnyAsync(ct); return Results.Ok(new { status = "ready" }); }
     catch { return Results.StatusCode(503); }
 });
 app.MapGet("/login", (HttpContext c, IAntiforgery af) =>
@@ -154,6 +182,7 @@ app.MapGet("/app.js", () => Results.File(Path.Combine(app.Environment.WebRootPat
 app.MapGet("/", () => Results.File(Path.Combine(app.Environment.WebRootPath, "index.html"), "text/html")).RequireAuthorization();
 var api = app.MapGroup("/api").RequireAuthorization();
 api.MapFunctions();
+api.MapOperations();
 api.MapPost("/logout", async (HttpContext c) => { await c.SignOutAsync(); return Results.NoContent(); });
 api.MapGet("/handlers", (HandlerCatalog c) => c.Types.Keys.Order());
 api.MapGet("/stats", async (CancellationToken ct) =>
@@ -174,9 +203,9 @@ api.MapGet("/jobs/{id:guid}", async (Guid id, CancellationToken ct) =>
     var job = await db.Jobs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
     return job is null ? Results.NotFound() : Results.Ok(job);
 });
-api.MapPost("/jobs", async (SubmitJob input, HandlerCatalog catalog, CancellationToken ct) =>
+api.MapPost("/jobs", async (SubmitJob input, HandlerCatalog catalog, DatabaseCommands database, ApplicationCommands apps, CancellationToken ct) =>
 {
-    if (!ValidInput(input.Type, input.Payload, catalog) || input.MaxAttempts is < 1 or > 20 || input.IdempotencyKey?.Length > 160 ||
+    if (!ValidInput(input.Type, input.Payload, catalog) || !OperationEndpoints.ValidPayload(input.Type, input.Payload, database, apps) || input.MaxAttempts is < 1 or > 20 || input.IdempotencyKey?.Length > 160 ||
         input.DelaySeconds is < 0 or > 31536000 || input.IdempotencyKey?.StartsWith("schedule:", StringComparison.Ordinal) == true)
         return Results.BadRequest(new { error = "Invalid handler, payload, attempt limit, delay or idempotency key" });
     await using var db = await factory.CreateDbContextAsync(ct);
@@ -215,9 +244,9 @@ api.MapPost("/jobs/{id:guid}/retry", async (Guid id, CancellationToken ct) =>
 });
 api.MapGet("/schedules", async (CancellationToken ct) =>
 { await using var db = await factory.CreateDbContextAsync(ct); return await db.Schedules.AsNoTracking().OrderBy(x => x.NextUtc).Take(100).ToListAsync(ct); });
-api.MapPost("/schedules", async (SubmitSchedule input, HandlerCatalog catalog, CancellationToken ct) =>
+api.MapPost("/schedules", async (SubmitSchedule input, HandlerCatalog catalog, DatabaseCommands database, ApplicationCommands apps, CancellationToken ct) =>
 {
-    if (!ValidInput(input.Type, input.Payload, catalog) || input.IntervalSeconds is < 10 or > 31536000) return Results.BadRequest();
+    if (!ValidInput(input.Type, input.Payload, catalog) || !OperationEndpoints.ValidPayload(input.Type, input.Payload, database, apps) || input.IntervalSeconds is < 10 or > 31536000) return Results.BadRequest();
     await using var db = await factory.CreateDbContextAsync(ct);
     if (!await FunctionEndpoints.ValidPayloadAsync(input.Type, input.Payload, db, ct)) return Results.BadRequest();
     var schedule = new Schedule { Type = input.Type, Payload = input.Payload.GetRawText(), IntervalSeconds = input.IntervalSeconds, NextUtc = DateTime.UtcNow.AddSeconds(input.IntervalSeconds) };

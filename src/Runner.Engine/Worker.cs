@@ -69,7 +69,7 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
             await using var scope = scopes.CreateAsyncScope();
             if (!catalog.Types.TryGetValue(job.Type, out var type)) throw new InvalidOperationException("Unknown handler");
             var handler = (IJobHandler)scope.ServiceProvider.GetRequiredService(type);
-            await handler.ExecuteAsync(new JobContext(job.Id, job.Payload, job.Attempts) { ReportResult = json =>
+            await handler.ExecuteAsync(new JobContext(job.Id, job.Payload, job.Attempts) { WriteLogAsync = (level, message, ct) => store.WriteLogAsync(job, level, message, ct), ReportResult = json =>
             {
                 if (System.Text.Encoding.UTF8.GetByteCount(json) > 65536) throw new InvalidOperationException("Job result exceeds 64 KiB");
                 using var parsed = System.Text.Json.JsonDocument.Parse(json);
@@ -78,7 +78,8 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
             execution.Token.ThrowIfCancellationRequested();
         }
         catch (OperationCanceledException) { error = stopping.IsCancellationRequested ? "shutdown" : "cancelled_or_timed_out"; }
-        catch (Exception e) { error = "handler_failed"; log.LogError(e, "Job handler failed"); }
+        catch (JobExecutionException e) { error = e.Code; log.LogError("Job operation failed: {ErrorCode}", error); }
+        catch (Exception e) { error = "handler_failed"; log.LogError("Job handler failed: {ErrorType}", e.GetType().Name); }
         finally
         {
             await heartbeatStop.CancelAsync();
