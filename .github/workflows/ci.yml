@@ -1,0 +1,33 @@
+name: verify
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ci-test-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - run: dotnet restore Runner.sln --locked-mode
+      - run: dotnet build Runner.sln -c Release --no-restore
+      - run: dotnet test tests/Runner.Tests -c Release --no-build --logger 'trx;LogFileName=sqlite.trx'
+      - run: dotnet test tests/Runner.Tests -c Release --no-build --logger 'trx;LogFileName=postgres.trx'
+        env:
+          TEST_POSTGRES: Host=localhost;Username=postgres;Password=ci-test-only
+      - run: python3 scripts/smoke.py
+      - run: python3 scripts/smoke.py
+        env:
+          SMOKE_POSTGRES: Host=localhost;Database=runner_smoke;Username=postgres;Password=ci-test-only
+      - run: dotnet publish src/Runner.Host -c Release --no-restore -o artifacts/publish
+      - run: docker build -t runner:ci .

@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: runner
+      POSTGRES_USER: runner
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runner -d runner"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  initialize:
+    build: .
+    command: ["--initialize"]
+    environment: &environment
+      Storage__Provider: Postgres
+      Storage__ConnectionString: Host=postgres;Database=runner;Username=runner;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      Security__ApiKey: ${RUNNER_API_KEY:?Set RUNNER_API_KEY to at least 32 characters}
+      Security__KeyDirectory: /data/keys
+      AllowedHosts: ${RUNNER_ALLOWED_HOSTS:-localhost;127.0.0.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+  runner:
+    build: .
+    environment: *environment
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - keys:/data/keys
+    read_only: true
+    tmpfs:
+      - /tmp:uid=1654,gid=1654,mode=1770
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 40s
+volumes:
+  postgres:
+  keys:

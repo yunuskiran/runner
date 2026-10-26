@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../Runner.Contracts/Runner.Contracts.csproj"/><FrameworkReference Include="Microsoft.AspNetCore.App"/><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.14"/><PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3"/></ItemGroup></Project>
