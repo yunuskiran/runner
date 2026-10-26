@@ -1,12 +1,12 @@
 # Runner
 
-.NET 10 / C# latest ile cloud ve on-prem için plugin tabanlı, dashboard içeren durable worker. Quartz, Hangfire veya Redis gerektirmez. Worker belleğinde kalıcı job durumu tutulmaz; süreçler DB üzerinden koordinasyon yapar.
+A plugin-based durable worker with an operations dashboard, built with .NET 10 and the latest C# for cloud and on-premises deployments. Runs without Quartz, Hangfire, or Redis. Workers keep durable job state in the database and coordinate through it.
 
-**Durum:** çalışan ve test edilen başlangıç platformu. Production kurulumu için aşağıdaki operasyon gereksinimleri tamamlanmalıdır; yük testi, bağımsız güvenlik incelemesi ve gerçek deployment doğrulaması henüz yapılmadı.
+**Status:** a working, tested foundation. Complete the operational requirements below before production deployment. Load testing, an independent security review, and validation in a real deployment have not yet been performed.
 
-## Hızlı başlangıç
+## Quick start
 
-Gerekenler: `global.json` ile eşleşen .NET 10 SDK, Bash, OpenSSL. Node gerekmez.
+Requirements: the .NET 10 SDK specified in `global.json`, Bash, and OpenSSL. Node.js is not required.
 
 ```bash
 dotnet restore Runner.sln --locked-mode
@@ -15,11 +15,11 @@ dotnet test tests/Runner.Tests -c Release --no-build
 bash scripts/dev.sh
 ```
 
-Geliştirme sunucusu 5080 portunu kullanır. Giriş için `src/Runner.Host/data/operator.key` dosyasındaki yerel anahtarı kullanın. Anahtar ilk çalıştırmada üretilir, Git'e alınmaz. SQLite DB ve cookie anahtarları `data/` altında korunur. `scripts/dev.sh` yalnızca yerel geliştirme içindir; production'da Development ortamını kullanmayın.
+The development server uses port 5080. Sign in with the local key stored in `src/Runner.Host/data/operator.key`. The key is generated on first startup and excluded from Git. The SQLite database and cookie keys are persisted under `data/`. Use `scripts/dev.sh` for local development only; do not use the Development environment in production.
 
-Dashboard: canlı durum sayaçları, handler seçimi, JSON payload, gecikmeli dispatch, idempotency key, durum filtresi, sayfalama, cancellation, dead-letter retry ve sabit aralıklı schedule yönetimi. UI framework/CDN bağımlılığı yoktur.
+The dashboard includes live state counters, handler selection, JSON payloads, delayed dispatch, idempotency keys, state filtering, pagination, cancellation, dead-letter retries, and fixed-interval schedule management. It has no UI framework or CDN dependencies.
 
-## Mimari
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -31,27 +31,27 @@ flowchart LR
     Host --> OTLP[Optional OTLP collector]
 ```
 
-- `Runner.Contracts`: küçük handler sözleşmesi; EF/host bağımlılığı yok.
-- `Runner.Engine`: kalıcı state machine, conditional SQL ownership, heartbeat, scheduler, retry ve retention.
-- `Runner.Host`: API, cookie / API key authentication, dashboard, readiness ve telemetry.
-- `Runner.SamplePlugin`: ayrı DLL'den yüklenen örnek handler.
-- `Runner.Tests`: gerçek ilişkisel DB üzerinde concurrency ve recovery testleri.
+- `Runner.Contracts`: a small handler contract with no EF or host dependencies.
+- `Runner.Engine`: the durable state machine, conditional SQL ownership, heartbeats, scheduling, retries, and retention.
+- `Runner.Host`: the API, cookie and API key authentication, dashboard, readiness checks, and telemetry.
+- `Runner.SamplePlugin`: a sample handler loaded from a separate DLL.
+- `Runner.Tests`: concurrency and recovery tests against real relational databases.
 
-Tek instance geliştirmede SQLite kullanın. Birden çok replica / cloud deployment için PostgreSQL kullanın. SQLite dosyasını NFS üzerinde paylaşmayın. Dashboard/API ve worker aynı executable içindedir; `Runner__WorkerEnabled=false` ile yalnız control plane çalıştırılabilir. Worker-only deployment ayrı executable değildir; network erişimini deployment seviyesinde kısıtlayın.
+Use SQLite for single-instance development. Use PostgreSQL for multiple replicas and cloud deployments. Do not share a SQLite file over NFS. The dashboard/API and worker run in the same executable; set `Runner__WorkerEnabled=false` to run only the control plane. There is no separate worker-only executable; restrict network access at the deployment level.
 
-## Çalışma garantileri
+## Execution guarantees
 
-Teslimat **at least once**. Worker claim işlemi DB'de conditional update ile yapılır; her claim yeni token alır. Heartbeat ve completion hem token hem lease geçerliliğini kontrol eder. Crash sonrası lease süresi dolunca başka instance işi alabilir. Son denemede crash olan işler dead-letter olur.
+Delivery is **at least once**. Workers claim jobs through conditional database updates, and each claim receives a new token. Heartbeats and completion updates check both the token and lease validity. After a crash, another instance can claim the job once its lease expires. Jobs that crash on their final attempt move to dead-letter state.
 
-Lease fencing yalnız Runner state'ini korur. Plugin'in başka sistemlere yaptığı yazımlar transactional değildir: dış side effect için `JobContext.JobId` ile idempotency, unique constraint veya transactional outbox kullanın. API idempotency key, aynı type/payload için saklanan işi döndürür; farklı payload için 409. Başarılı/iptal edilmiş iş retention ile silindiğinde key de serbest kalır. Sonsuza kadar dedup garantisi yoktur.
+Lease fencing protects Runner's state. Plugin writes to external systems are not part of the same transaction: use `JobContext.JobId` for idempotency, a unique constraint, or a transactional outbox for external side effects. An API idempotency key returns the stored job for the same type and payload; a different payload returns 409. When retention removes a successful or cancelled job, its key becomes available again. Deduplication is not permanent.
 
-Retry: sınırlı exponential backoff + jitter, maksimum 20 deneme (varsayılan 5). Dead-letter otomatik silinmez. Timeout ve cancel **cooperative**; handler cancellation token'a uymalıdır. Güvenilmeyen veya token'ı yok sayan kod için ayrı process/container gerekir. App içi plugin isolation bir güvenlik sınırı değildir.
+Retries use bounded exponential backoff with jitter, with a maximum of 20 attempts and a default of 5. Dead-letter jobs are not deleted automatically. Timeouts and cancellation are **cooperative**: handlers must respect the cancellation token. Untrusted code or code that ignores cancellation requires a separate process or container. In-process plugin isolation is not a security boundary.
 
-Scheduler cron/timezone motoru değildir: UTC ile 10 saniye ve üzeri sabit aralıklar. Kaçırılan tick'ler tek işe birleştirilir; schedule advancement + enqueue tek transaction'dır. Schedule silmek kuyruğa girmiş işleri silmez. Tüm host saatlerini NTP ile senkron tutun; lease kontrolleri UTC uygulama saati kullanır.
+The scheduler uses fixed UTC intervals of at least 10 seconds. It does not provide cron or time zone scheduling. Missed ticks coalesce into one job; schedule advancement and enqueueing commit in a single transaction. Deleting a schedule does not remove jobs already queued. Keep all host clocks synchronized with NTP; lease checks use the application's UTC clock.
 
-## Plugin yazma
+## Writing a plugin
 
-`Runner.Contracts` referanslı .NET 10 class library oluşturun:
+Create a .NET 10 class library that references `Runner.Contracts`:
 
 ```csharp
 public sealed class InvoiceHandler : IJobHandler
@@ -59,30 +59,30 @@ public sealed class InvoiceHandler : IJobHandler
     public string Type => "billing.invoice.v1";
     public async Task ExecuteAsync(JobContext job, CancellationToken ct)
     {
-        // JSON'u doğrulayın; JobId ile side effect'i idempotent yapın.
+        // Validate the JSON and use JobId to make the side effect idempotent.
         await SendIdempotently(job.JobId, job.Payload, ct);
     }
 }
 ```
 
-Plugin'i dependency DLL'leri ve `.deps.json` ile deploy edin. `Plugins__0=plugins/YourPlugin.dll` gibi açık allowlist tanımlayın; path'ler executable dizinine göredir. Ortak `Runner.Contracts.dll` dosyasının plugin klasöründen kopyasını yüklemeyin. `Runner.SamplePlugin.csproj` örneğini kullanın. Handler concrete tipleri scoped DI ile oluşturulur; framework servisleri injection ile kullanılabilir. Ek servis kayıtları için host composition root'u genişletin. Her `Type` deployment içindeki tüm worker'larda aynı olmalı; duplicate type başlangıcı durdurur. Hot reload yok: yeni plugin için rolling deployment gerekir. Payload contract'larını version'layın; sırada eski version job varken handler'ı kaldırmayın. Plugin koduna payload validation sorumluluğu aittir.
+Deploy the plugin with its dependency DLLs and `.deps.json` file. Configure an explicit allowlist such as `Plugins__0=plugins/YourPlugin.dll`; paths are relative to the executable directory. Do not load a separate copy of the shared `Runner.Contracts.dll` from the plugin directory. Use `Runner.SamplePlugin.csproj` as an example. Concrete handler types are created through scoped dependency injection and can receive framework services. Extend the host composition root to register additional services. Every worker in a deployment must use consistent `Type` identifiers; duplicate types prevent startup. Plugins require a rolling deployment to update; hot reload is not supported. Version payload contracts, and keep old handlers available while jobs for those versions remain queued. Plugins are responsible for validating their payloads.
 
 ## API
 
-Tüm `/api/*` çağrıları operator cookie veya `X-Runner-Key` ister. Mutasyonlarda ayrıca `X-Runner-Request: 1` gerekir. Anahtarı URL'ye koymayın.
+All `/api/*` requests require an operator cookie or `X-Runner-Key`. Mutations also require `X-Runner-Request: 1`. Never put the key in a URL.
 
-| Method | Path | İşlem |
+| Method | Path | Operation |
 | --- | --- | --- |
-| GET | `/api/handlers` | Yüklenen job type'ları |
-| GET | `/api/stats` | Retained job durum sayıları |
-| GET | `/api/jobs?page=0&state=Running` | En çok 50 kayıt; sayfa üst sınırı 10000 |
-| GET | `/api/jobs/{id}` | Payload dahil job detayı |
-| POST | `/api/jobs` | Enqueue |
-| POST | `/api/jobs/{id}/cancel` | Cooperative cancellation isteği |
-| POST | `/api/jobs/{id}/retry` | Dead-letter / cancelled işi sıfırlayıp yeniden sırala |
-| GET / POST | `/api/schedules` | İlk 100 schedule / schedule oluştur |
-| DELETE | `/api/schedules/{id}` | Schedule sil |
-| GET | `/health/live`, `/health/ready` | Process / DB schema erişimi |
+| GET | `/api/handlers` | List loaded job types |
+| GET | `/api/stats` | Count retained jobs by state |
+| GET | `/api/jobs?page=0&state=Running` | List up to 50 jobs; maximum page index is 10000 |
+| GET | `/api/jobs/{id}` | Get job details, including the payload |
+| POST | `/api/jobs` | Enqueue a job |
+| POST | `/api/jobs/{id}/cancel` | Request cooperative cancellation |
+| POST | `/api/jobs/{id}/retry` | Reset and requeue a dead-letter or cancelled job |
+| GET / POST | `/api/schedules` | List the first 100 schedules or create a schedule |
+| DELETE | `/api/schedules/{id}` | Delete a schedule |
+| GET | `/health/live`, `/health/ready` | Check the process and database schema access |
 
 Job request:
 
@@ -90,64 +90,64 @@ Job request:
 {"type":"sample.echo","payload":{"delayMs":100},"maxAttempts":5,"delaySeconds":0,"idempotencyKey":"example-001"}
 ```
 
-Schedule request: `{"type":"sample.echo","payload":{},"intervalSeconds":60}`. Maksimum JSON payload 64 KiB, HTTP body 128 KiB. `sample.echo` payload'ına `"fail":true` ekleyerek retry/dead-letter deneyebilirsiniz. Readiness DB ve schema erişimini ölçer; tüm plugin'lerin harici servislerine erişim veya worker ilerlemesi için garanti değildir.
+Schedule request: `{"type":"sample.echo","payload":{},"intervalSeconds":60}`. The maximum JSON payload is 64 KiB; the maximum HTTP body is 128 KiB. Add `"fail":true` to a `sample.echo` payload to exercise retry and dead-letter behavior. Readiness checks database and schema access; it does not guarantee connectivity to every plugin's external services or worker progress.
 
-## Konfigürasyon
+## Configuration
 
-ASP.NET Core config düzeni: appsettings + environment variables (`__` nested separator) + command line. Secret değerleri repository'ye veya appsettings'e yazmayın.
+Configuration follows ASP.NET Core conventions: appsettings, environment variables with `__` as the nesting separator, and command-line arguments. Keep secret values out of the repository and appsettings files.
 
-| Ayar | Varsayılan / anlamı |
+| Setting | Default / purpose |
 | --- | --- |
-| `Storage__Provider` | `Sqlite` veya `Postgres` |
-| `Storage__ConnectionString` | Local SQLite; production'da secret manager üzerinden PostgreSQL DSN |
-| `Storage__Initialize` | `false`; geliştirmede schema oluşturma |
-| `Security__ApiKey` | Zorunlu, en az 32 karakter; tercihen 32 random byte / 64 hex karakter |
-| `Security__KeyDirectory` | Cookie data-protection key dizini; kalıcı ve erişimi kısıtlı volume kullanın |
-| `Security__TrustedProxy` | Opsiyonel tek reverse proxy IP; forwarded proto/for sadece bu adresten kabul edilir |
-| `AllowedHosts` | `localhost;127.0.0.1`; production hostname'i açıkça ekleyin |
-| `Runner__Concurrency` | 4, sınır 1–128 |
-| `Runner__PollMilliseconds` | 1000, en az 100 |
+| `Storage__Provider` | `Sqlite` or `Postgres` |
+| `Storage__ConnectionString` | Local SQLite; supply a PostgreSQL DSN through a secret manager in production |
+| `Storage__Initialize` | `false`; create the schema during development |
+| `Security__ApiKey` | Required, at least 32 characters; preferably 32 random bytes encoded as 64 hexadecimal characters |
+| `Security__KeyDirectory` | Cookie data protection key directory; use a persistent volume with restricted access |
+| `Security__TrustedProxy` | Optional single reverse proxy IP; forwarded protocol and client IP headers are accepted only from this address |
+| `AllowedHosts` | `localhost;127.0.0.1`; explicitly add the production hostname |
+| `Runner__Concurrency` | 4, allowed range 1–128 |
+| `Runner__PollMilliseconds` | 1000, minimum 100 |
 | `Runner__LeaseSeconds` | 60 |
-| `Runner__HeartbeatSeconds` | 15, lease'in en fazla üçte biri |
+| `Runner__HeartbeatSeconds` | 15, at most one third of the lease duration |
 | `Runner__JobTimeoutSeconds` | 300, cooperative |
-| `Runner__RetentionDays` | 14; yalnız succeeded/cancelled silinir |
+| `Runner__RetentionDays` | 14; deletes only succeeded and cancelled jobs |
 | `Runner__WorkerEnabled` | true |
-| `Telemetry__OtlpEnabled` | false; true olduğunda traces + metrics export |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector adresi; SDK standart config'i |
+| `Telemetry__OtlpEnabled` | false; enable to export traces and metrics |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, using standard SDK configuration |
 
-`Runner` ActivitySource / Meter: `runner.jobs.finished` ve `runner.jobs.duration`, ASP.NET request ve runtime metrics. `runner.jobs.finished` lokal execution bitişlerini ölçer; kalıcı job sayısı değildir. Log scope'ları JobId/JobType/Attempt içerir. API hata yanıtlarında exception/payload yoktur; plugin exception'ları loglanır, plugin'ler secret loglamamalıdır.
+The `Runner` ActivitySource and Meter expose `runner.jobs.finished` and `runner.jobs.duration`, alongside ASP.NET request and runtime metrics. `runner.jobs.finished` measures local execution completions rather than durable job counts. Log scopes include JobId, JobType, and Attempt. API error responses exclude exceptions and payloads. Plugin exceptions are logged; plugins must avoid logging secrets.
 
-## Cloud / on-prem deploy
+## Cloud and on-premises deployment
 
-Docker, Kubernetes, Linux systemd veya Azure Container Apps üzerinde aynı host çalışır. İmaj .NET non-root kullanıcısıyla çalışır. Gerçek bir cloud hesabına deploy yapılmadı.
+The same host can run on Docker, Kubernetes, Linux systemd, or Azure Container Apps. The image is configured to run as the .NET non-root user. Deployment to a real cloud account has not been performed.
 
 ```bash
-# Secret'ları güvenli şekilde export edin: POSTGRES_PASSWORD, RUNNER_API_KEY.
-# RUNNER_ALLOWED_HOSTS production DNS adınızı içermeli.
+# Export secrets securely: POSTGRES_PASSWORD, RUNNER_API_KEY.
+# RUNNER_ALLOWED_HOSTS must include your production DNS name.
 docker compose up --build -d
 ```
 
-Compose PostgreSQL health check sonrası tek initialization job çalıştırır, ardından Runner başlar. PostgreSQL portu host'a açılmaz; Runner portu yalnız 127.0.0.1'e bind edilir. Production'da önüne TLS reverse proxy koyun; app container'a doğrudan erişimi engelleyin. `Security__TrustedProxy` actual proxy IP olmalı. Production cookie HTTPS ister; düz HTTP üzerinde browser login'i çalışmaz. Health/API smoke için API key ile loopback HTTP kullanabilirsiniz.
+Compose runs one initialization job after PostgreSQL passes its health check, then starts Runner. PostgreSQL's port is not published to the host; Runner binds only to 127.0.0.1. In production, place a TLS reverse proxy in front of Runner and prevent direct access to the application container. Set `Security__TrustedProxy` to the actual proxy IP. Production cookies require HTTPS; browser login will not work over plain HTTP. You can use loopback HTTP with an API key for health and API smoke checks.
 
-Şema başlangıcı için: publish dizininde `dotnet Runner.Host.dll --schema` ile provider'a uygun SQL üretin; DB operatörü script'i uygulasın. Alternatif: tek kontrollü bootstrap sürecinde `--initialize`. `EnsureCreated` yalnız boş DB bootstrap'ıdır; **schema upgrade/migration sistemi değildir**. Şema değişmeden önce version'lı migration + rollout planı eklenmelidir. Runtime DB rolü mevcut şemada DML yetkileriyle sınırlanmalı; bootstrap ayrı DDL rolü kullanmalı. PostgreSQL bağlantısında güvenilmeyen ağda `SSL Mode=VerifyFull` ve uygun CA kullanın.
+For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database; it is **not a schema upgrade or migration system**. Add versioned migrations and a rollout plan before changing the schema. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
 
-Production öncesi: DB backup + restore tatbikatı, kaynak limitleri ve yük testi, TLS, network policy, secret rotation, telemetry collector, alarm eşikleri (queue age/dead-letter/lease loss), schema rollout, graceful drain ve plugin contract uyumluluğu doğrulanmalı. Cookie key'lerini replica'lar arasında paylaşın; at-rest key şifrelemesini platform/KMS ile yönetin. Anahtar rotasyonu mevcut 8 saatlik cookie'leri hemen iptal etmez: acil session revoke için cookie key ring rotasyonu veya process-level auth revocation ekleyin. Built-in auth tek operator rolüdür; çok kullanıcılı RBAC/audit ihtiyaçları için OIDC gateway ve merkezi audit entegrasyonu ayrıca gerekir. Genel internete doğrudan açmayın.
+Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating the API key does not immediately revoke existing eight-hour cookies: immediate session revocation requires cookie key ring rotation or an additional authentication revocation mechanism. Built-in authentication has a single operator role; multi-user RBAC and audit requirements need an OIDC gateway and centralized audit integration. Restrict access before exposing the service to the public internet.
 
-## Maliyet seçimi
+## Cost considerations
 
-Başlangıç: tek makine + SQLite. Dayanıklı çok replica: PostgreSQL (mevcut DB, küçük VM veya uygun managed plan). Cache zorunlu değil. Redis/Azure cache eviction nedeniyle primary job store olmamalı. DynamoDB adapter henüz yok; conditional write / lease / schedule transaction ve query index semantiklerini uygulayan ayrı storage + yönetim katmanı gerekir. Free tier ve Azure/AWS fiyatları hesap/bölgeye göre değişir; ücretsiz çalışma garantisi yoktur.
+Start with a single machine and SQLite. For durable operation across multiple replicas, use PostgreSQL through an existing database, a small VM, or a suitable managed plan. A cache is optional. Redis or Azure cache eviction makes them unsuitable as the primary job store for this design. A DynamoDB adapter is not implemented; it would require separate storage and management layers supporting conditional writes, leases, schedule transactions, and indexed queries. Free tiers and Azure/AWS pricing depend on the account and region; free operation is not guaranteed.
 
-## Doğrulama
+## Validation
 
 ```bash
 dotnet test tests/Runner.Tests -c Release
-# İzole test DB'leri oluşturup silmek için bu connection rolüne CREATEDB gerekir:
+# This connection role needs CREATEDB to create and delete isolated test databases:
 TEST_POSTGRES='Host=localhost;Username=postgres;Password=...' dotnet test tests/Runner.Tests -c Release
 python3 scripts/smoke.py
-# Sadece test için ayrılmış boş DB kullanın; smoke DB'yi otomatik silmez.
+# Use an empty database dedicated to testing; the smoke test does not delete it automatically.
 SMOKE_POSTGRES='Host=localhost;Database=runner_smoke;Username=postgres;Password=...' python3 scripts/smoke.py
 dotnet publish src/Runner.Host -c Release -o artifacts/publish
 docker build -t runner:local .
 ```
 
-Store testleri: concurrent claim, lease takeover/fencing, expired completion rejection, retry/dead-letter, final-attempt crash recovery, cancellation, atomic schedule dispatch, retention ve unique idempotency. Black-box smoke gerçek host ile API auth, antiforgery login, plugin loading/execution, retry, cancellation ve schedule dispatch çalıştırır. CI her iki DB provider'ını test eder.
+Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both database providers.
