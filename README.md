@@ -4,6 +4,23 @@ A plugin-based durable worker with an operations dashboard, built with .NET 10 a
 
 **Status:** a working, tested foundation. Complete the operational requirements below before production deployment. Load testing, an independent security review, and validation in a real deployment have not yet been performed.
 
+## Dashboard
+
+Real screenshots captured from the running application. The function registry is enabled for these screenshots.
+
+![Runner operations dashboard](docs/images/dashboard.png)
+
+<details>
+<summary>C# function registry and persisted job results</summary>
+
+![Database-backed C# function registry](docs/images/function-registry.png)
+
+![Function execution result](docs/images/function-result.png)
+
+[View the mobile dashboard](docs/images/dashboard-mobile.png)
+
+</details>
+
 ## Quick start
 
 Requirements: the .NET 10 SDK specified in `global.json`, Bash, and OpenSSL. Node.js is not required.
@@ -67,12 +84,80 @@ public sealed class InvoiceHandler : IJobHandler
 
 Deploy the plugin with its dependency DLLs and `.deps.json` file. Configure an explicit allowlist such as `Plugins__0=plugins/YourPlugin.dll`; paths are relative to the executable directory. Do not load a separate copy of the shared `Runner.Contracts.dll` from the plugin directory. Use `Runner.SamplePlugin.csproj` as an example. Concrete handler types are created through scoped dependency injection and can receive framework services. Extend the host composition root to register additional services. Every worker in a deployment must use consistent `Type` identifiers; duplicate types prevent startup. Plugins require a rolling deployment to update; hot reload is not supported. Version payload contracts, and keep old handlers available while jobs for those versions remain queued. Plugins are responsible for validating their payloads.
 
+## Database-registered C# functions (Roslyn)
+
+Enable scripting explicitly on **all** participating API and worker instances:
+
+```bash
+Scripting__Enabled=true bash scripts/dev.sh
+```
+
+The development script initializes a fresh database or applies the version 2 upgrade to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
+
+Use **C# function registry** in the dashboard to compile and register a named version, inspect compilation diagnostics, select the registered version, supply JSON arguments, and queue a run. Use **Details** in job activity to inspect the persisted JSON result. The registry supports pagination, viewing source, and enabling or disabling versions.
+
+Each `(name, version)` is unique. Source is immutable through the API: register a new version to change it. Jobs and schedules reference the function version's stable `functionId`; registering a newer version does not change queued jobs or retry behavior. Disabling a version rejects new submissions and prevents executions that have not yet started. It does not interrupt a running script. If a queued script encounters a disabled version, normal retries and dead-letter rules apply. Re-enable the version before retrying those jobs. Function definitions are retained independently of job retention and are not deleted through the API.
+
+Example registration body for `POST /api/functions`:
+
+```json
+{
+  "name": "orders.total",
+  "version": 1,
+  "source": "var quantity = Arguments.GetProperty(\"quantity\").GetInt32(); return new { total = quantity * 7, jobId = JobId };"
+}
+```
+
+Registration compiles the script before saving it and returns an ID, source hash, and creation time. Compilation failures return HTTP 400 with diagnostic IDs and one-based line/column positions. Concurrent registration of the same name/version returns 409. Registration is limited to 10 requests per minute per host. Source is limited to 32 KiB of UTF-8 text; `#r` and `#load` directives are unsupported. NuGet package restore from scripts is not supported.
+
+Queue a function through the existing job API; replace the example ID with the registration response's ID:
+
+```json
+{
+  "type": "runner.script",
+  "payload": {
+    "functionId": "11111111-1111-1111-1111-111111111111",
+    "arguments": { "quantity": 6 }
+  },
+  "maxAttempts": 3,
+  "idempotencyKey": "order-total-001"
+}
+```
+
+The same payload works with `POST /api/schedules` and an `intervalSeconds` value. Arguments must be a JSON object. Scripts receive these globals:
+
+| Global | Purpose |
+| --- | --- |
+| `Arguments` | JSON arguments as a `JsonElement` |
+| `JobId` | Stable job ID for idempotent external side effects |
+| `Attempt` | Current attempt number, starting at 1 |
+| `CancellationToken` | Cooperative timeout, shutdown, cancellation, and lease-loss signal |
+
+Scripts may use top-level `await` and return JSON-serializable values:
+
+```csharp
+await Task.Delay(100, CancellationToken);
+var quantity = Arguments.GetProperty("quantity").GetInt32();
+CancellationToken.ThrowIfCancellationRequested();
+return new { total = quantity * 7, jobId = JobId, attempt = Attempt };
+```
+
+Successful output is serialized into `resultJson`, limited to 64 KiB, and committed with the same token/expiry checks as job completion. Failed attempts discard their result. The dashboard displays the parsed result. Serialization errors, runtime exceptions, and excessive output follow normal retry rules. Avoid returning secrets or sensitive objects; results are persisted in the database and accessible to operators.
+
+**Trust model:** Roslyn executes code inside the worker process with its filesystem, network, environment, and database access. This is not a sandbox. Only trusted operators should register reviewed code, and database write access must be restricted. API source immutability and hashes support version consistency; they do not defend against a database administrator who rewrites both source and hash. Cancellation is cooperative and cannot terminate an infinite loop that ignores the token. Use a separate constrained process/container for untrusted code or hard CPU/memory/time limits. Compilation delegates are cached by source hash with 32 entries; evicting a delegate does not unload generated assemblies, so recycle workers periodically if many distinct versions execute. Native AOT and trimmed deployments are not supported for this scripting host.
+
+Scripting is disabled by default. While disabled, the registry endpoints return 404 and `runner.script` is not advertised as a handler. Keep the feature setting consistent across replicas, and drain script jobs before disabling it cluster-wide. Existing compiled DLL plugins remain available regardless of this setting.
+
 ## API
 
 All `/api/*` requests require an operator cookie or `X-Runner-Key`. Mutations also require `X-Runner-Request: 1`. Never put the key in a URL.
 
 | Method | Path | Operation |
 | --- | --- | --- |
+| GET | `/api/scripting` | Inspect whether scripting is enabled |
+| GET / POST | `/api/functions` | List up to 50 function versions per page or compile and register one |
+| GET | `/api/functions/{id}` | Inspect an immutable function version and its source |
+| PATCH | `/api/functions/{id}` | Enable or disable a version with `{"enabled": false}` |
 | GET | `/api/handlers` | List loaded job types |
 | GET | `/api/stats` | Count retained jobs by state |
 | GET | `/api/jobs?page=0&state=Running` | List up to 50 jobs; maximum page index is 10000 |
@@ -98,6 +183,7 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 
 | Setting | Default / purpose |
 | --- | --- |
+| `Scripting__Enabled` | `false`; opt in to trusted Roslyn execution on every worker/API instance |
 | `Storage__Provider` | `Sqlite` or `Postgres` |
 | `Storage__ConnectionString` | Local SQLite; supply a PostgreSQL DSN through a secret manager in production |
 | `Storage__Initialize` | `false`; create the schema during development |
@@ -129,7 +215,13 @@ docker compose up --build -d
 
 Compose runs one initialization job after PostgreSQL passes its health check, then starts Runner. PostgreSQL's port is not published to the host; Runner binds only to 127.0.0.1. In production, place a TLS reverse proxy in front of Runner and prevent direct access to the application container. Set `Security__TrustedProxy` to the actual proxy IP. Production cookies require HTTPS; browser login will not work over plain HTTP. You can use loopback HTTP with an API key for health and API smoke checks.
 
-For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database; it is **not a schema upgrade or migration system**. Add versioned migrations and a rollout plan before changing the schema. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
+For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2 upgrade from the published directory with the correct provider and connection string:
+
+```bash
+dotnet Runner.Host.dll --upgrade-scripting
+```
+
+The upgrade adds the function registry and nullable job result column, preserves existing jobs and schedules, records schema version 2, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
 
 Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating the API key does not immediately revoke existing eight-hour cookies: immediate session revocation requires cookie key ring rotation or an additional authentication revocation mechanism. Built-in authentication has a single operator role; multi-user RBAC and audit requirements need an OIDC gateway and centralized audit integration. Restrict access before exposing the service to the public internet.
 
@@ -150,4 +242,6 @@ dotnet publish src/Runner.Host -c Release -o artifacts/publish
 docker build -t runner:local .
 ```
 
-Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both database providers.
+To regenerate the committed screenshots, start a local instance with scripting enabled and sample data, install Playwright separately from the application, and run `scripts/capture-dashboard.cjs`. It requires Chromium (default `/usr/bin/chromium`, override with `CHROMIUM_PATH`), `RUNNER_SCREENSHOT_URL` for the target instance, and a local operator key file (`RUNNER_KEY_FILE`, default `src/Runner.Host/data/operator.key`). The capture tool creates sample functions and jobs in that instance; use a disposable development database. It never renders or saves the operator key in an image.
+
+Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both database providers. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.

@@ -92,6 +92,49 @@ public sealed class StoreTests : IAsyncLifetime
         await using var db = factory.CreateDbContext(); db.Jobs.Add(new Job { IdempotencyKey = "same" }); await db.SaveChangesAsync();
         db.Jobs.Add(new Job { IdempotencyKey = "same" }); await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
     }
+    [Fact] public async Task Functions_upgrade_preserves_jobs_and_is_repeatable()
+    {
+        var original = await Add();
+        await using var db = factory.CreateDbContext();
+        await db.Database.ExecuteSqlRawAsync("DROP TABLE \"Functions\"; ALTER TABLE \"Jobs\" DROP COLUMN \"ResultJson\";");
+        await SchemaUpgrade.ApplyFunctionsAsync(db);
+        await SchemaUpgrade.ApplyFunctionsAsync(db);
+        Assert.Equal(original.Id, (await db.Jobs.SingleAsync()).Id);
+        db.Functions.Add(new FunctionDefinition { Name = "upgraded", Version = 1, Source = "return 1;", SourceHash = ScriptCompiler.Hash("return 1;") });
+        await db.SaveChangesAsync(); Assert.Equal(1, await db.Functions.CountAsync());
+    }
+    [Fact] public async Task Script_handler_loads_pinned_function_and_returns_json()
+    {
+        using var compiler = new ScriptCompiler();
+        var function = new FunctionDefinition { Name = "double", Version = 1,
+            Source = "return new { value = Arguments.GetProperty(\"x\").GetInt32() * 2, attempt = Attempt };" };
+        function.SourceHash = ScriptCompiler.Hash(function.Source);
+        await using (var db = factory.CreateDbContext()) { db.Functions.Add(function); await db.SaveChangesAsync(); }
+        var handler = new ScriptFunctionHandler(factory, compiler, Microsoft.Extensions.Options.Options.Create(new ScriptingOptions { Enabled = true }));
+        string? output = null;
+        var payload = System.Text.Json.JsonSerializer.Serialize(new { functionId = function.Id, arguments = new { x = 21 } });
+        await handler.ExecuteAsync(new Runner.Contracts.JobContext(Guid.NewGuid(), payload, 2) { ReportResult = json => output = json }, default);
+        using var result = System.Text.Json.JsonDocument.Parse(output!);
+        Assert.Equal(42, result.RootElement.GetProperty("value").GetInt32());
+        Assert.Equal(2, result.RootElement.GetProperty("attempt").GetInt32());
+        await using var verify = factory.CreateDbContext();
+        await verify.Functions.ExecuteUpdateAsync(s => s.SetProperty(x => x.Enabled, false));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => handler.ExecuteAsync(new Runner.Contracts.JobContext(Guid.NewGuid(), payload, 1), default));
+    }
+    [Fact] public async Task Result_is_committed_only_by_current_owner()
+    {
+        await Add(); var first = (await Claim())!; var second = (await Claim(now.AddSeconds(31)))!;
+        Assert.False(await store.CompleteAsync(first, now.AddSeconds(32), null, default, "1"));
+        Assert.True(await store.CompleteAsync(second, now.AddSeconds(32), null, default, "42"));
+        await using var db = factory.CreateDbContext(); Assert.Equal("42", (await db.Jobs.SingleAsync()).ResultJson);
+    }
+    [Fact] public async Task Function_versions_are_unique()
+    {
+        await using var db = factory.CreateDbContext();
+        db.Functions.Add(new FunctionDefinition { Name = "same", Version = 1 }); await db.SaveChangesAsync();
+        db.Functions.Add(new FunctionDefinition { Name = "same", Version = 1 });
+        await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
+    }
     private sealed class TestFactory(DbContextOptions<RunnerDb> options) : IDbContextFactory<RunnerDb>
     { public RunnerDb CreateDbContext() => new(options); }
 }

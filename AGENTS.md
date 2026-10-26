@@ -9,4 +9,5 @@ This cloud task already has an isolated checkout. Use this checkout; do not crea
 - Preserve at-least-once semantics, atomic schedule dispatch, lease-token and expiry checks. Never rely on in-memory locks for cross-instance correctness.
 - Plugins are trusted code, not sandboxed code. No exactly-once promises for external side effects.
 - Use PostgreSQL for multi-instance deployments; local SQLite is a development/single-node option.
-- Schema is currently initial-bootstrap only. Any model upgrade needs explicit versioned migration and deployment planning before production use.
+- Initial bootstrap uses EnsureCreated. Existing initial-release databases use the explicit version 2 --upgrade-scripting command. Future model changes need new versioned upgrades, preservation/repeatability tests on both providers, and deployment planning.
+- Roslyn scripting is disabled by default and runs trusted code with host privileges. Preserve immutable function versions, queued function IDs, result fencing and cooperative cancellation; never describe in-process scripting as sandboxed.

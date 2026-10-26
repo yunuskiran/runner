@@ -7,4 +7,8 @@ public interface IJobHandler
     Task ExecuteAsync(JobContext context, CancellationToken cancellationToken);
 }
 
-public sealed record JobContext(Guid JobId, string Payload, int Attempt);
+public sealed record JobContext(Guid JobId, string Payload, int Attempt)
+{
+    /// <summary>Optional JSON result sink, bounded to 64 KiB by the worker.</summary>
+    public Action<string>? ReportResult { get; init; }
+}

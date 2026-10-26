@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory() as tmp:
     env = dict(os.environ, ASPNETCORE_ENVIRONMENT='Development', ASPNETCORE_URLS=base,
                Security__ApiKey=key, Security__KeyDirectory=tmp+'/keys', Storage__Initialize='true',
                Storage__ConnectionString='Data Source='+tmp+'/jobs.db;Default Timeout=30', Runner__PollMilliseconds='100',
-               Runner__LeaseSeconds='12', Runner__HeartbeatSeconds='2', Runner__Concurrency='2')
+               Scripting__Enabled=os.environ.get('SMOKE_SCRIPTING', 'false'), Runner__LeaseSeconds='12', Runner__HeartbeatSeconds='2', Runner__Concurrency='2')
     if os.environ.get('SMOKE_POSTGRES'):
         env.update(Storage__Provider='Postgres', Storage__ConnectionString=os.environ['SMOKE_POSTGRES'])
     log = open(tmp+'/host.log', 'w+')
@@ -46,7 +46,38 @@ with tempfile.TemporaryDirectory() as tmp:
         assert request('/api/jobs',auth=False)[0]==401
         assert request('/api/jobs',headers={'X-Runner-Key':'bad'})[0]==401
         assert request('/api/jobs','POST',{},headers={'X-Runner-Request':''})[0]==400
-        assert request('/api/handlers')[1]==['sample.echo']
+        scripting = os.environ.get('SMOKE_SCRIPTING', 'false').lower() == 'true'
+        assert set(request('/api/handlers')[1]) == ({'sample.echo', 'runner.script'} if scripting else {'sample.echo'})
+        assert request('/api/functions', auth=False)[0] == 401
+        assert request('/api/scripting')[1]['enabled'] == scripting
+        if not scripting: assert request('/api/functions')[0] == 404
+        if scripting:
+            name='smoke.'+secrets.token_hex(8)
+            invalid=request('/api/functions','POST',{'name':name,'version':1,'source':'return missing;'})
+            assert invalid[0]==400 and 'diagnostics' in invalid[1],invalid
+            code, function=request('/api/functions','POST',{'name':name,'version':1,'source':'return new { total = Arguments.GetProperty(\"quantity\").GetInt32() * 7, jobId = JobId };'})
+            assert code==201,function
+            assert request('/api/functions','POST',{'name':name,'version':1,'source':'return 99;'})[0]==409
+            script_body={'type':'runner.script','payload':{'functionId':function['id'],'arguments':{'quantity':6}},'maxAttempts':1}
+            code, execution=request('/api/jobs','POST',dict(script_body,delaySeconds=2)); assert code==201,execution
+            assert request('/api/functions','POST',{'name':name,'version':2,'source':'return 999;'})[0]==201
+            result=wait_job(execution['id'],'Succeeded')
+            assert json.loads(result['resultJson'])['total']==42,result
+            assert request('/api/functions/'+function['id'],'PATCH',{'enabled':False})[0]==204
+            assert request('/api/jobs','POST',script_body)[0]==400
+            assert request('/api/functions/'+function['id'],'PATCH',{'enabled':True})[0]==204
+            code, scheduled=request('/api/schedules','POST',{'type':'runner.script','payload':script_body['payload'],'intervalSeconds':10})
+            assert code==201,scheduled
+            deadline=time.time()+20
+            while time.time()<deadline:
+                candidates=[j for j in request('/api/jobs')[1] if j['type']=='runner.script' and j['id']!=execution['id'] and j['state']=='Succeeded']
+                if candidates:
+                    assert json.loads(request('/api/jobs/'+candidates[0]['id'])[1]['resultJson'])['total']==42
+                    break
+                time.sleep(.3)
+            else: raise AssertionError('Script schedule did not complete')
+            assert request('/api/schedules/'+scheduled['id'],'DELETE')[0]==204
+            print('PASS: script registration, compile diagnostics, immutable version pinning, JSON results, disable/enable, scheduled scripts')
         assert request('/api/jobs','POST',{'type':'missing','payload':{}})[0]==400
         body={'type':'sample.echo','payload':{'delayMs':100},'idempotencyKey':'smoke-'+secrets.token_hex(8)}
         code, job=request('/api/jobs','POST',body); assert code==201,job

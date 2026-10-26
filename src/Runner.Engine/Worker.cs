@@ -63,12 +63,18 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
         var heartbeat = Heartbeat(job, execution, heartbeatStop.Token);
         var timer = Stopwatch.StartNew();
         string? error = null;
+        string? resultJson = null;
         try
         {
             await using var scope = scopes.CreateAsyncScope();
             if (!catalog.Types.TryGetValue(job.Type, out var type)) throw new InvalidOperationException("Unknown handler");
             var handler = (IJobHandler)scope.ServiceProvider.GetRequiredService(type);
-            await handler.ExecuteAsync(new JobContext(job.Id, job.Payload, job.Attempts), execution.Token);
+            await handler.ExecuteAsync(new JobContext(job.Id, job.Payload, job.Attempts) { ReportResult = json =>
+            {
+                if (System.Text.Encoding.UTF8.GetByteCount(json) > 65536) throw new InvalidOperationException("Job result exceeds 64 KiB");
+                using var parsed = System.Text.Json.JsonDocument.Parse(json);
+                resultJson = json;
+            } }, execution.Token);
             execution.Token.ThrowIfCancellationRequested();
         }
         catch (OperationCanceledException) { error = stopping.IsCancellationRequested ? "shutdown" : "cancelled_or_timed_out"; }
@@ -81,7 +87,7 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
         // On shutdown leave ownership to expire; another process can recover the job.
         if (stopping.IsCancellationRequested) return;
         using var finalization = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var completed = await store.CompleteAsync(job, DateTime.UtcNow, error, finalization.Token);
+        var completed = await store.CompleteAsync(job, DateTime.UtcNow, error, finalization.Token, resultJson);
         if (!completed) log.LogWarning("Completion rejected: lease lost or cancellation requested");
         Finished.Add(1, new KeyValuePair<string, object?>("outcome", completed ? error ?? "succeeded" : "lease_lost"));
         Duration.Record(timer.Elapsed.TotalSeconds);

@@ -12,4 +12,8 @@ export ASPNETCORE_ENVIRONMENT=Development
 export ASPNETCORE_URLS="${ASPNETCORE_URLS:-http://127.0.0.1:5080}"
 export Storage__Initialize=true
 echo 'Operator key is in src/Runner.Host/data/operator.key (local secret; do not commit).'
-exec dotnet run --project src/Runner.Host -c Release --no-launch-profile
+dotnet build src/Runner.Host -c Release
+cd src/Runner.Host
+dotnet bin/Release/net10.0/Runner.Host.dll --initialize
+dotnet bin/Release/net10.0/Runner.Host.dll --upgrade-scripting
+exec dotnet bin/Release/net10.0/Runner.Host.dll

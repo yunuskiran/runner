@@ -28,6 +28,10 @@ jobs:
       - run: python3 scripts/smoke.py
       - run: python3 scripts/smoke.py
         env:
+          SMOKE_SCRIPTING: "true"
           SMOKE_POSTGRES: Host=localhost;Database=runner_smoke;Username=postgres;Password=ci-test-only
+      - run: python3 scripts/smoke.py
+        env:
+          SMOKE_SCRIPTING: "true"
       - run: dotnet publish src/Runner.Host -c Release --no-restore -o artifacts/publish
       - run: docker build -t runner:ci .

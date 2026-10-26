@@ -13,6 +13,7 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 using Runner.Engine;
+using Runner.Host;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using OpenTelemetry.Metrics;
@@ -37,6 +38,13 @@ var connection = builder.Configuration["Storage:ConnectionString"] ?? throw new 
 if (provider is not ("Sqlite" or "Postgres")) throw new InvalidOperationException("Unsupported storage provider");
 if (provider == "Sqlite") Directory.CreateDirectory("data");
 builder.Services.AddDbContextFactory<RunnerDb>(o => { if (provider == "Postgres") o.UseNpgsql(connection); else o.UseSqlite(connection); });
+builder.Services.Configure<ScriptingOptions>(builder.Configuration.GetSection("Scripting"));
+builder.Services.AddSingleton<ScriptCompiler>();
+if (builder.Configuration.GetValue<bool>("Scripting:Enabled"))
+{
+    builder.Services.AddScoped<ScriptFunctionHandler>();
+    builder.Services.AddScoped<Runner.Contracts.IJobHandler>(s => s.GetRequiredService<ScriptFunctionHandler>());
+}
 builder.Services.AddSingleton<JobStore>();
 builder.Services.AddSingleton<IJobStore>(s => s.GetRequiredService<JobStore>());
 PluginLoader.AddPlugins(builder.Services, builder.Configuration.GetSection("Plugins").Get<string[]>()!
@@ -55,8 +63,11 @@ builder.Services.AddAntiforgery(o => o.Cookie.SameSite = SameSiteMode.Strict);
 var dataProtection = builder.Services.AddDataProtection().SetApplicationName("Runner");
 if (builder.Configuration["Security:KeyDirectory"] is { Length: > 0 } keyDir)
     dataProtection.PersistKeysToFileSystem(new DirectoryInfo(keyDir));
-builder.Services.AddRateLimiter(o => o.AddFixedWindowLimiter("login", l =>
-{ l.PermitLimit = 10; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; }));
+builder.Services.AddRateLimiter(o =>
+{
+    o.AddFixedWindowLimiter("login", l => { l.PermitLimit = 10; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; });
+    o.AddFixedWindowLimiter("script-registration", l => { l.PermitLimit = 10; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; });
+});
 var app = builder.Build();
 if (builder.Configuration["Security:TrustedProxy"] is { Length: > 0 } proxy)
 {
@@ -71,6 +82,12 @@ if (args.Contains("--schema"))
 {
     await using var db = await factory.CreateDbContextAsync();
     Console.WriteLine(db.Database.GenerateCreateScript()); return;
+}
+if (args.Contains("--upgrade-scripting"))
+{
+    await using var db = await factory.CreateDbContextAsync();
+    await SchemaUpgrade.ApplyFunctionsAsync(db);
+    Console.WriteLine("Schema version 2 verified: scripting tables and job results are available."); return;
 }
 if (args.Contains("--initialize") || builder.Configuration.GetValue<bool>("Storage:Initialize"))
 {
@@ -111,7 +128,8 @@ app.UseAuthorization();
 app.MapGet("/health/live", () => Results.Ok(new { status = "alive" }));
 app.MapGet("/health/ready", async (CancellationToken ct) =>
 {
-    try { await using var db = await factory.CreateDbContextAsync(ct); _ = await db.Jobs.AsNoTracking().AnyAsync(ct); return Results.Ok(new { status = "ready" }); }
+    try { await using var db = await factory.CreateDbContextAsync(ct); _ = await db.Jobs.AsNoTracking().Select(x => x.ResultJson).FirstOrDefaultAsync(ct);
+        _ = await db.Functions.AsNoTracking().AnyAsync(ct); return Results.Ok(new { status = "ready" }); }
     catch { return Results.StatusCode(503); }
 });
 app.MapGet("/login", (HttpContext c, IAntiforgery af) =>
@@ -135,6 +153,7 @@ app.MapGet("/style.css", () => Results.File(Path.Combine(app.Environment.WebRoot
 app.MapGet("/app.js", () => Results.File(Path.Combine(app.Environment.WebRootPath, "app.js"), "text/javascript")).RequireAuthorization();
 app.MapGet("/", () => Results.File(Path.Combine(app.Environment.WebRootPath, "index.html"), "text/html")).RequireAuthorization();
 var api = app.MapGroup("/api").RequireAuthorization();
+api.MapFunctions();
 api.MapPost("/logout", async (HttpContext c) => { await c.SignOutAsync(); return Results.NoContent(); });
 api.MapGet("/handlers", (HandlerCatalog c) => c.Types.Keys.Order());
 api.MapGet("/stats", async (CancellationToken ct) =>
@@ -161,6 +180,7 @@ api.MapPost("/jobs", async (SubmitJob input, HandlerCatalog catalog, Cancellatio
         input.DelaySeconds is < 0 or > 31536000 || input.IdempotencyKey?.StartsWith("schedule:", StringComparison.Ordinal) == true)
         return Results.BadRequest(new { error = "Invalid handler, payload, attempt limit, delay or idempotency key" });
     await using var db = await factory.CreateDbContextAsync(ct);
+    if (!await FunctionEndpoints.ValidPayloadAsync(input.Type, input.Payload, db, ct)) return Results.BadRequest(new { error = "Invalid or disabled function version / arguments" });
     var key = string.IsNullOrWhiteSpace(input.IdempotencyKey) ? null : input.IdempotencyKey;
     if (key is not null && await db.Jobs.AsNoTracking().SingleOrDefaultAsync(x => x.IdempotencyKey == key, ct) is { } existing)
         return existing.Type == input.Type && existing.Payload == input.Payload.GetRawText() ? Results.Ok(existing) : Results.Conflict(new { error = "Key already used with a different job" });
@@ -190,7 +210,7 @@ api.MapPost("/jobs/{id:guid}/retry", async (Guid id, CancellationToken ct) =>
     var n = await db.Jobs.Where(x => x.Id == id && (x.State == JobState.DeadLetter || x.State == JobState.Cancelled))
         .ExecuteUpdateAsync(s => s.SetProperty(x => x.State, JobState.Pending).SetProperty(x => x.Attempts, 0)
             .SetProperty(x => x.AvailableUtc, DateTime.UtcNow).SetProperty(x => x.FinishedUtc, (DateTime?)null)
-            .SetProperty(x => x.CancellationRequested, false).SetProperty(x => x.ErrorCode, (string?)null), ct);
+            .SetProperty(x => x.CancellationRequested, false).SetProperty(x => x.ResultJson, (string?)null).SetProperty(x => x.ErrorCode, (string?)null), ct);
     return n == 1 ? Results.Accepted() : Results.Conflict();
 });
 api.MapGet("/schedules", async (CancellationToken ct) =>
@@ -199,6 +219,7 @@ api.MapPost("/schedules", async (SubmitSchedule input, HandlerCatalog catalog, C
 {
     if (!ValidInput(input.Type, input.Payload, catalog) || input.IntervalSeconds is < 10 or > 31536000) return Results.BadRequest();
     await using var db = await factory.CreateDbContextAsync(ct);
+    if (!await FunctionEndpoints.ValidPayloadAsync(input.Type, input.Payload, db, ct)) return Results.BadRequest();
     var schedule = new Schedule { Type = input.Type, Payload = input.Payload.GetRawText(), IntervalSeconds = input.IntervalSeconds, NextUtc = DateTime.UtcNow.AddSeconds(input.IntervalSeconds) };
     db.Schedules.Add(schedule); await db.SaveChangesAsync(ct); return Results.Created($"/api/schedules/{schedule.Id}", schedule);
 });

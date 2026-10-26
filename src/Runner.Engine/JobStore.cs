@@ -5,7 +5,7 @@ public interface IJobStore
 {
     Task<Job?> ClaimAsync(string worker, DateTime now, TimeSpan lease, CancellationToken ct);
     Task<bool> RenewAsync(Guid id, Guid token, DateTime now, TimeSpan lease, CancellationToken ct);
-    Task<bool> CompleteAsync(Job job, DateTime now, string? errorCode, CancellationToken ct);
+    Task<bool> CompleteAsync(Job job, DateTime now, string? errorCode, CancellationToken ct, string? resultJson = null);
 }
 
 /// <summary>All ownership changes use conditional SQL updates; no process-local locks are required.</summary>
@@ -30,7 +30,7 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory) : IJobStore
                 ((x.State == JobState.Pending && x.AvailableUtc <= now) || (x.State == JobState.Running && x.LeaseUntilUtc <= now)))
                 .ExecuteUpdateAsync(s => s.SetProperty(x => x.State, JobState.Running)
                     .SetProperty(x => x.LeaseToken, token).SetProperty(x => x.LeaseUntilUtc, now + lease)
-                    .SetProperty(x => x.Worker, worker).SetProperty(x => x.Attempts, x => x.Attempts + 1), ct);
+                    .SetProperty(x => x.ResultJson, (string?)null).SetProperty(x => x.Worker, worker).SetProperty(x => x.Attempts, x => x.Attempts + 1), ct);
             if (count == 1) return await db.Jobs.AsNoTracking().SingleAsync(x => x.Id == id, ct);
         }
         return null;
@@ -44,7 +44,7 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory) : IJobStore
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.LeaseUntilUtc, now + lease), ct) == 1;
     }
 
-    public async Task<bool> CompleteAsync(Job job, DateTime now, string? errorCode, CancellationToken ct)
+    public async Task<bool> CompleteAsync(Job job, DateTime now, string? errorCode, CancellationToken ct, string? resultJson = null)
     {
         await using var db = await factory.CreateDbContextAsync(ct);
         var state = errorCode is null ? JobState.Succeeded : job.Attempts >= job.MaxAttempts ? JobState.DeadLetter : JobState.Pending;
@@ -52,7 +52,7 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory) : IJobStore
         return await db.Jobs.Where(x => x.Id == job.Id && x.State == JobState.Running &&
                 x.LeaseToken == job.LeaseToken && x.LeaseUntilUtc > now && !x.CancellationRequested)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.State, state).SetProperty(x => x.ErrorCode, errorCode)
-                .SetProperty(x => x.AvailableUtc, now + delay)
+                .SetProperty(x => x.ResultJson, errorCode == null ? resultJson : null).SetProperty(x => x.AvailableUtc, now + delay)
                 .SetProperty(x => x.FinishedUtc, state == JobState.Pending ? (DateTime?)null : now)
                 .SetProperty(x => x.LeaseToken, (Guid?)null).SetProperty(x => x.LeaseUntilUtc, (DateTime?)null), ct) == 1;
     }

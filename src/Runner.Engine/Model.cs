@@ -20,6 +20,7 @@ public sealed class Job
     public string? Worker { get; set; }
     public bool CancellationRequested { get; set; }
     public string? ErrorCode { get; set; }
+    public string? ResultJson { get; set; }
 }
 
 public sealed class Schedule
@@ -36,8 +37,12 @@ public sealed class RunnerDb(DbContextOptions<RunnerDb> options) : DbContext(opt
 {
     public DbSet<Job> Jobs => Set<Job>();
     public DbSet<Schedule> Schedules => Set<Schedule>();
+    public DbSet<FunctionDefinition> Functions => Set<FunctionDefinition>();
     protected override void OnModelCreating(ModelBuilder b)
     {
+        b.Entity<FunctionDefinition>().HasIndex(x => new { x.Name, x.Version }).IsUnique();
+        b.Entity<FunctionDefinition>().Property(x => x.Name).HasMaxLength(120);
+        b.Entity<FunctionDefinition>().Property(x => x.SourceHash).HasMaxLength(64);
         b.Entity<Job>().HasIndex(x => new { x.State, x.AvailableUtc });
         b.Entity<Job>().HasIndex(x => x.LeaseUntilUtc);
         b.Entity<Job>().HasIndex(x => x.CreatedUtc);
