@@ -2,7 +2,7 @@
 """Verify the local SDK package, then compile a consumer using a fresh NuGet cache."""
 import os,pathlib,subprocess,tempfile,zipfile,hashlib,json
 root=pathlib.Path(__file__).resolve().parents[1]
-package_id=os.environ.get('RUNNER_PLUGIN_PACKAGE_ID','YunusKiran.Runner.PluginSdk')
+package_id=os.environ.get('RUNNER_PLUGIN_PACKAGE_ID','Runner.PluginSdk')
 version=os.environ.get('RUNNER_PLUGIN_SDK_VERSION','0.1.0')
 package=root/f'artifacts/nuget/{package_id}.{version}.nupkg'
 symbols=package.with_name(f'{package_id}.{version}.snupkg')

@@ -280,7 +280,7 @@
         "resolved": "9.0.18",
         "contentHash": "1/iz9Eex1TBMYdAk+m3igaMvL+nk+rY1EqL6u93an/j1ghxmB24vGOKXkVFy3NSPA39s1H/+SNoK257tHoXoLA=="
       },
-      "YunusKiran.Runner.PluginSdk": {
+      "Runner.PluginSdk": {
         "type": "Project"
       }
     }

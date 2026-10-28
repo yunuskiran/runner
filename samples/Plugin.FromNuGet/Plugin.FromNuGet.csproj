@@ -3,7 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <RunnerPluginPackageId Condition="'$(RunnerPluginPackageId)' == ''">YunusKiran.Runner.PluginSdk</RunnerPluginPackageId>
+    <RunnerPluginPackageId Condition="'$(RunnerPluginPackageId)' == ''">Runner.PluginSdk</RunnerPluginPackageId>
     <RunnerPluginSdkVersion Condition="'$(RunnerPluginSdkVersion)' == ''">0.1.0</RunnerPluginSdkVersion>
     <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
   </PropertyGroup>

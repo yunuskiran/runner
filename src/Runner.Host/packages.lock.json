@@ -339,11 +339,11 @@
           "Microsoft.EntityFrameworkCore.SqlServer": "[10.0.14, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[10.0.14, )",
           "Npgsql.EntityFrameworkCore.PostgreSQL": "[10.0.3, )",
-          "System.Security.Cryptography.Pkcs": "[10.0.14, )",
-          "YunusKiran.Runner.PluginSdk": "[0.1.0, )"
+          "Runner.PluginSdk": "[0.1.0, )",
+          "System.Security.Cryptography.Pkcs": "[10.0.14, )"
         }
       },
-      "YunusKiran.Runner.PluginSdk": {
+      "Runner.PluginSdk": {
         "type": "Project"
       }
     }

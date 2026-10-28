@@ -4,6 +4,8 @@ A plugin-based durable worker with an operations dashboard, built with .NET 10 a
 
 **Status:** a working, tested foundation. Complete the operational requirements below before production deployment. Load testing, an independent security review, and validation in a real deployment have not yet been performed.
 
+See the [prioritized roadmap](docs/ROADMAP.md) for remaining product features and production validation work.
+
 ## Dashboard
 
 Real screenshots captured from the running application. The function registry is enabled for these screenshots.
@@ -129,7 +131,7 @@ It applies earlier upgrades and adds version 5 policy/lease fields while retaini
 
 ## NuGet SDK for plugin authors
 
-The contract project builds the **`YunusKiran.Runner.PluginSdk`** NuGet package (initial version `0.1.0`). It contains `IRunnerPlugin`, `JobContext`, `RunnerPluginAttribute`, the execution-mode enum, XML documentation and an MSBuild target that keeps the host-supplied `Runner.Contracts.dll` out of plugin output. The DLL assembly name remains `Runner.Contracts` and its assembly version remains `1.0.0.0` for existing plugins.
+The contract project builds the **`Runner.PluginSdk`** NuGet package (initial version `0.1.0`). It contains `IRunnerPlugin`, `JobContext`, `RunnerPluginAttribute`, the execution-mode enum, XML documentation and an MSBuild target that keeps the host-supplied `Runner.Contracts.dll` out of plugin output. The DLL assembly name remains `Runner.Contracts` and its assembly version remains `1.0.0.0` for existing plugins.
 
 Build release artifacts locally:
 
@@ -138,12 +140,12 @@ bash scripts/pack-plugin-sdk.sh 0.1.0
 python3 scripts/verify-plugin-sdk.py
 ```
 
-Artifacts are `artifacts/nuget/YunusKiran.Runner.PluginSdk.0.1.0.nupkg`, its `.snupkg`, and `checksums.json`. The verifier restores a consumer from a fresh local NuGet cache, publishes it to `artifacts/sdk-consumer`, and checks that it excludes the shared contract. The example project is `samples/Plugin.FromNuGet`; it is outside the main solution so normal solution restore does not depend on a not-yet-published package. Its local-feed demonstration omits a lockfile because the SDK is generated as part of this workflow.
+Artifacts are `artifacts/nuget/Runner.PluginSdk.0.1.0.nupkg`, its `.snupkg`, and `checksums.json`. The verifier restores a consumer from a fresh local NuGet cache, publishes it to `artifacts/sdk-consumer`, and checks that it excludes the shared contract. The example project is `samples/Plugin.FromNuGet`; it is outside the main solution so normal solution restore does not depend on a not-yet-published package. Its local-feed demonstration omits a lockfile because the SDK is generated as part of this workflow.
 
 After the SDK is available in your feed, a plugin project references it:
 
 ```xml
-<PackageReference Include="YunusKiran.Runner.PluginSdk" Version="0.1.0" PrivateAssets="all" />
+<PackageReference Include="Runner.PluginSdk" Version="0.1.0" PrivateAssets="all" />
 ```
 
 Publish the plugin library with .NET 10, then upload its DLL/dependency output through the dashboard. The SDK NuGet package is for authoring plugins; dashboard package versions are the immutable deployed plugin bundles. Include private runtime dependencies and `.deps.json` when uploading those bundles. The SDK package itself is not an executable plugin entry point.

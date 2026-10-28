@@ -2,6 +2,12 @@
 
 Build .NET 10 plugins for the Runner dashboard package manager. This package supplies `Runner.Contracts.dll`, XML API documentation, and an MSBuild target that keeps the shared contract out of plugin output. The host supplies that assembly at runtime.
 
+Reference the SDK in your plugin project:
+
+```xml
+<PackageReference Include="Runner.PluginSdk" Version="0.1.0" PrivateAssets="all" />
+```
+
 ```csharp
 using System.Text.Json;
 using Runner.Contracts;
