@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null, resources = null, alertPage = 0;
+let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null, resources = null, alertPage = 0, packagesEnabled = false, packagePage = 0, versionPage = 0, selectedPackage = null, selectedPackageVersion = null, packageFiles = [], packageChannels = [];
 const esc = v => String(v ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 async function api(path, method='GET', body) {
   const r = await fetch('/api'+path, {method, headers:{'Content-Type':'application/json','X-Runner-Request':'1'}, body:body === undefined ? undefined : JSON.stringify(body)});
@@ -22,6 +22,7 @@ async function refresh() {
     $('schedule-list').innerHTML=schedules.length?schedules.map(s=>`<div class="schedule-item"><strong>${esc(s.type)}</strong><span>Every ${s.intervalSeconds}s · next ${esc(new Date(s.nextUtc).toLocaleString())}</span><button class="text" data-schedule="${s.id}">Delete</button></div>`).join(''):'<p>No recurring schedules.</p>';
     if(scriptingEnabled) await refreshFunctions();
     await refreshOperations();
+    if(packagesEnabled) await refreshPackages();
     $('updated').textContent='Updated '+new Date().toLocaleTimeString();
     if($('status').textContent.startsWith('Connecting'))status('Control plane connected · persistent job storage');
   } catch(e) {status(e.message,true);} finally {refreshing=false;}
@@ -30,7 +31,7 @@ async function act(fn, message) {try{await fn();status(message);await refresh();
 $('dispatch').onsubmit=e=>{e.preventDefault();act(()=>api('/jobs','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),maxAttempts:Number($('attempts').value),delaySeconds:Number($('delay').value),idempotencyKey:$('key').value||null}),'Job accepted.');};
 $('schedule').onsubmit=e=>{e.preventDefault();act(()=>api('/schedules','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),intervalSeconds:Number($('interval').value)}),'Schedule created.');};
 $('rows').onclick=e=>{const b=e.target.closest('[data-action]');if(!b)return;
-  if(b.dataset.action==='details') act(async()=>{const [job,attempts,logs]=await Promise.all([api(`/jobs/${b.dataset.id}`),api(`/jobs/${b.dataset.id}/attempts`),api(`/jobs/${b.dataset.id}/logs`)]);$('job-detail-content').textContent=JSON.stringify({...job,result:job.resultJson ? JSON.parse(job.resultJson) : null,attempts,logs},null,2);$('job-detail').showModal();},'Job details loaded.');
+  if(b.dataset.action==='details') act(async()=>{$('detail-title').textContent='Job details';const [job,attempts,logs]=await Promise.all([api(`/jobs/${b.dataset.id}`),api(`/jobs/${b.dataset.id}/attempts`),api(`/jobs/${b.dataset.id}/logs`)]);$('job-detail-content').textContent=JSON.stringify({...job,result:job.resultJson ? JSON.parse(job.resultJson) : null,attempts,logs},null,2);$('job-detail').showModal();},'Job details loaded.');
   else act(()=>api(`/jobs/${b.dataset.id}/${b.dataset.action}`,'POST'),'Operation accepted.');
 };
 $('schedule-list').onclick=e=>{const b=e.target.closest('[data-schedule]');if(b&&confirm('Delete this schedule?'))act(()=>api(`/schedules/${b.dataset.schedule}`,'DELETE'),'Schedule deleted.');};
@@ -98,4 +99,79 @@ api('/resources').then(r=>{
   $('process-submit').disabled=!r.applications.length;
   $('resource-status').textContent=`${r.connections.length} database connections · ${r.applications.length} applications configured. Configure named resources securely in Operations settings.`;
   $('alert-status').textContent=r.webhookConfigured?'Durable alert inbox · webhook delivery configured.':'Durable alert inbox · no webhook configured; alerts remain available here.';
+}).catch(e=>status(e.message,true));
+
+async function uploadPackage(form) {
+  const response=await fetch('/api/packages/install',{method:'POST',headers:{'X-Runner-Request':'1'},body:form});
+  if(response.status===401){location.href='/login';throw Error('Session expired');}
+  let result;try{result=await response.json();}catch{result={};}
+  if(!response.ok)throw Error(result.error||([429,503].includes(response.status)?'Package install limit reached. Try again in a minute.':`Package upload failed (${response.status})`));
+  return result;
+}
+function choosePackageFiles(files,folder) {
+  packageFiles=Array.from(files).map(file=>({file,path:folder?file.webkitRelativePath.split('/').slice(1).join('/'):file.name}));
+  const bytes=packageFiles.reduce((sum,x)=>sum+x.file.size,0);
+  $('package-file-summary').textContent=`${packageFiles.length} files · ${(bytes/1048576).toFixed(2)} MiB selected. Limit: 512 files / 50 MiB.`;
+  const dlls=packageFiles.filter(x=>x.path.toLowerCase().endsWith('.dll')&&!x.path.toLowerCase().endsWith('runner.contracts.dll'));
+  $('package-entry').innerHTML=dlls.map(x=>`<option value="${esc(x.path)}">${esc(x.path)}</option>`).join('');
+  $('package-install-button').disabled=!dlls.length||packageFiles.length>512||bytes>50*1048576;
+}
+$('package-files').onchange=e=>{$('package-folder').value='';choosePackageFiles(e.target.files,false);};
+$('package-folder').onchange=e=>{$('package-files').value='';choosePackageFiles(e.target.files,true);};
+$('package-install').onsubmit=e=>{e.preventDefault();act(async()=>{
+  $('package-install-button').disabled=true;$('package-feedback').textContent='Uploading and validating entry point…';
+  try {
+    const form=new FormData();form.append('packageId',$('package-id').value);form.append('version',$('package-version').value);
+    form.append('entryAssembly',$('package-entry').value);form.append('entryType',$('package-entry-type').value);
+    for(const entry of packageFiles)form.append('files',entry.file,entry.path);
+    const installed=await uploadPackage(form);selectedPackage=installed.packageId;selectedPackageVersion=null;$('package-selected').value='';versionPage=0;
+    $('package-feedback').textContent=`Installed ${installed.packageId} v${installed.version}. Activate a version below to enable execution.`;
+  } catch(error){$('package-feedback').textContent=error.message;throw error;}
+  finally{$('package-install-button').disabled=false;}
+},'Plugin package installed.');};
+async function refreshPackages() {
+  packageChannels=await api(`/packages?page=${packagePage}`);
+  $('package-list').innerHTML=packageChannels.length?packageChannels.map(p=>`<div class="package-item"><div><strong>${esc(p.packageId)}</strong><small>${p.enabled?'Enabled':'Disabled'} · active ${esc(p.activeVersion||'none')} · revision ${p.revision}</small></div><div><button class="text" data-package="${esc(p.packageId)}" data-package-action="versions">Versions / rollback</button>${p.enabled?`<button class="text" data-package="${esc(p.packageId)}" data-package-action="disable">Disable</button>`:''}</div></div>`).join(''):'<p>No packages installed. Select a DLL or folder above.</p>';
+  $('packages-page').textContent=`Page ${packagePage+1}`;$('packages-prev').disabled=packagePage===0;$('packages-next').disabled=packageChannels.length<50;
+  if(selectedPackage){await refreshPackageVersions();}
+}
+async function currentChannel() {
+  // Keep per-package state current even when the selected package is on another list page.
+  const current=await api(`/packages/${encodeURIComponent(selectedPackage)}/channel`);
+  return current;
+}
+async function refreshPackageVersions() {
+  const versions=await api(`/packages/${encodeURIComponent(selectedPackage)}/versions?page=${versionPage}`);
+  const channel=await currentChannel();
+  $('package-version-panel').hidden=false;$('package-version-title').textContent=`${selectedPackage} · installed versions`;
+  $('package-version-rows').innerHTML=versions.map(v=>`<tr><td><strong>${esc(v.version)}</strong>${channel.activeVersion===v.version?'<small>Active version</small>':''}</td><td>${esc(v.entryAssembly)}<small>${esc(v.entryType)}</small></td><td><small title="${esc(v.digest)}">${esc(v.digest.slice(0,16))}…</small></td><td><button class="text" data-version="${esc(v.version)}" data-version-action="select">Select</button><button class="text" data-version="${esc(v.version)}" data-version-action="activate">${channel.activeVersion===v.version?'Enable / keep active':'Activate / rollback'}</button></td></tr>`).join('');
+  $('versions-page').textContent=`Page ${versionPage+1}`;$('versions-prev').disabled=versionPage===0;$('versions-next').disabled=versions.length<50;
+  $('package-run').disabled=!channel.enabled||!selectedPackageVersion;$('package-schedule').disabled=$('package-run').disabled;
+}
+$('package-list').onclick=e=>{const b=e.target.closest('[data-package]');if(!b)return;act(async()=>{
+  if(selectedPackage!==b.dataset.package){selectedPackageVersion=null;$('package-selected').value='';}
+  selectedPackage=b.dataset.package;versionPage=0;
+  if(b.dataset.packageAction==='disable') {const channel=await currentChannel();await api(`/packages/${encodeURIComponent(selectedPackage)}/activation`,'POST',{version:channel.activeVersion,enabled:false,revision:channel.revision});}
+},'Package registry updated.');};
+$('package-version-rows').onclick=e=>{const b=e.target.closest('[data-version]');if(!b)return;act(async()=>{
+  if(b.dataset.versionAction==='select'){selectedPackageVersion=b.dataset.version;$('package-selected').value=`${selectedPackage} · v${selectedPackageVersion}`;$('package-feedback').textContent=`Active: ${selectedPackage} v${selectedPackageVersion}. New jobs can run immediately.`;}
+  else{const channel=await currentChannel();await api(`/packages/${encodeURIComponent(selectedPackage)}/activation`,'POST',{version:b.dataset.version,enabled:true,revision:channel.revision});selectedPackageVersion=b.dataset.version;$('package-selected').value=`${selectedPackage} · v${selectedPackageVersion}`;$('package-feedback').textContent=`Active: ${selectedPackage} v${selectedPackageVersion}. New jobs can run immediately.`;}
+},'Package selection updated.');};
+function packageJobPayload() {
+  if(!selectedPackage||!selectedPackageVersion)throw Error('Select an installed version first.');
+  return {packageId:selectedPackage,version:selectedPackageVersion,payload:JSON.parse($('package-payload').value)};
+}
+$('package-run').onclick=()=>act(()=>api('/jobs','POST',{type:'runner.plugin',payload:packageJobPayload()}),'Version-pinned plugin job queued.');
+$('package-schedule').onclick=()=>act(()=>api('/schedules','POST',{type:'runner.plugin',payload:packageJobPayload(),intervalSeconds:Number($('package-interval').value)}),'Version-pinned plugin schedule created.');
+$('package-history').onclick=()=>act(async()=>{
+  $('detail-title').textContent='Package activation history';$('job-detail-content').textContent=JSON.stringify(await api(`/packages/${encodeURIComponent(selectedPackage)}/history`),null,2);$('job-detail').showModal();
+},'Package activation history loaded.');
+$('packages-refresh').onclick=()=>act(refreshPackages,'Package registry refreshed.');
+$('packages-prev').onclick=()=>{packagePage=Math.max(0,packagePage-1);act(refreshPackages,'Package registry refreshed.');};
+$('packages-next').onclick=()=>{packagePage++;act(refreshPackages,'Package registry refreshed.');};
+$('versions-prev').onclick=()=>{versionPage=Math.max(0,versionPage-1);act(refreshPackageVersions,'Versions refreshed.');};
+$('versions-next').onclick=()=>{versionPage++;act(refreshPackageVersions,'Versions refreshed.');};
+api('/packages/settings').then(async settings=>{packagesEnabled=settings.enabled;$('package-workspace').hidden=!settings.enabled;
+  $('package-status').textContent=settings.enabled?'Trusted packages · upload from anywhere, activate live, and keep older versions for pinned jobs.':'Package management is disabled in host configuration.';
+  if(settings.enabled)await refreshPackages();
 }).catch(e=>status(e.message,true));

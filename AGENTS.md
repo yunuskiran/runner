@@ -9,9 +9,13 @@ This cloud task already has an isolated checkout. Use this checkout; do not crea
 - Preserve at-least-once semantics, atomic schedule dispatch, lease-token and expiry checks. Never rely on in-memory locks for cross-instance correctness.
 - Plugins are trusted code, not sandboxed code. No exactly-once promises for external side effects.
 - Use PostgreSQL for multi-instance deployments; local SQLite is a development/single-node option.
-- Initial bootstrap uses EnsureCreated. The --upgrade-operations command applies version 2 scripting and version 3 execution journal/alert upgrades, and is repeatable. Future model changes need new versioned upgrades, preservation/repeatability tests on both providers, and deployment planning.
+- Initial bootstrap uses EnsureCreated. The --upgrade-packages command applies version 2 scripting, version 3 execution journal/alerts, and version 4 package upgrades, and is repeatable. Future model changes need new versioned upgrades, preservation/repeatability tests on both providers, and deployment planning.
 - Roslyn scripting is disabled by default and runs trusted code with host privileges. Preserve immutable function versions, queued function IDs, result fencing and cooperative cancellation; never describe in-process scripting as sandboxed.
 
 - Built-in database/process operations use named Operations resources. Keep connection strings, executable paths and webhook secrets out of payloads and resource API responses. Never add shell-based execution.
 - Completion, journal and terminal alert writes must commit atomically with valid lease ownership. Webhook deliveries are at least once; preserve delivery fencing and receiver deduplication IDs.
 - Set TEST_DATABASE_POSTGRES and TEST_DATABASE_MSSQL to exercise real provider operations; default runs explicitly skip those two checks when services are unconfigured. Run SMOKE_OPERATIONS=true for logs, reports, process and signed webhook delivery checks.
+
+- Dashboard-installed packages implement IRunnerPlugin and run via runner.plugin. Preserve immutable package blobs/digests, entry-point validation, activation revision/history and enqueue-time version pinning. Disabled package channels must be filtered in both job claims and schedule dispatch.
+- User-selected files/folders are uploaded; never require a fixed source plugin folder or add Windows Service/SCM integration. Never execute a job-supplied DLL path.
+- For packaging changes run scripts/package_smoke.py with both job storage providers. Package upload size limits, portable paths, dependency loading, pause/resume and rollback are part of the contract.

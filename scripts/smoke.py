@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert request('/api/jobs',headers={'X-Runner-Key':'bad'})[0]==401
         assert request('/api/jobs','POST',{},headers={'X-Runner-Request':''})[0]==400
         scripting = os.environ.get('SMOKE_SCRIPTING', 'false').lower() == 'true'
-        assert set(request('/api/handlers')[1]) == ({'sample.echo', 'runner.database', 'runner.process', 'runner.script'} if scripting else {'sample.echo', 'runner.database', 'runner.process'})
+        assert set(request('/api/handlers')[1]) == ({'sample.echo', 'runner.database', 'runner.process', 'runner.plugin', 'runner.script'} if scripting else {'sample.echo', 'runner.database', 'runner.process', 'runner.plugin'})
         assert request('/api/functions', auth=False)[0] == 401
         assert request('/api/scripting')[1]['enabled'] == scripting
         if not scripting: assert request('/api/functions')[0] == 404
@@ -91,8 +91,13 @@ with tempfile.TemporaryDirectory() as tmp:
             deadline=time.time()+20
             while time.time()<deadline:
                 candidates=[j for j in request('/api/jobs')[1] if j['type']=='runner.script' and j['id']!=execution['id'] and j['state']=='Succeeded']
-                if candidates:
-                    assert json.loads(request('/api/jobs/'+candidates[0]['id'])[1]['resultJson'])['total']==42
+                selected=None
+                for candidate in candidates:
+                    detail=request('/api/jobs/'+candidate['id'])[1]
+                    if (detail.get('idempotencyKey') or '').startswith('schedule:'+scheduled['id']+':'):
+                        selected=detail;break
+                if selected:
+                    assert json.loads(selected['resultJson'])['total']==42
                     break
                 time.sleep(.3)
             else: raise AssertionError('Script schedule did not complete')
@@ -154,7 +159,13 @@ with tempfile.TemporaryDirectory() as tmp:
         deadline=time.time()+20
         while time.time()<deadline:
             jobs=request('/api/jobs')[1]
-            if any(j['type']=='sample.echo' and j['id'] not in [job['id'],failed['id'],future['id'],running['id']] and j['state']=='Succeeded' for j in jobs): break
+            matching=False
+            for candidate in jobs:
+                if candidate['type']=='sample.echo' and candidate['state']=='Succeeded':
+                    detail=request('/api/jobs/'+candidate['id'])[1]
+                    if (detail.get('idempotencyKey') or '').startswith('schedule:'+schedule['id']+':'):
+                        matching=True;break
+            if matching:break
             time.sleep(.3)
         else: raise AssertionError('Schedule did not produce a successful job')
         assert request('/api/schedules/'+schedule['id'],'DELETE')[0]==204

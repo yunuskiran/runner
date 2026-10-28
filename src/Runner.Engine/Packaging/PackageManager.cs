@@ -1,0 +1,154 @@
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Runner.Contracts;
+namespace Runner.Engine.Packaging;
+
+public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions<PackageOptions> options)
+{
+    public bool Enabled => options.Value.Enabled;
+    public async Task<PackageInfo> InstallAsync(string id, string version, string entryAssembly, string? entryType,
+        IReadOnlyCollection<PackageFile> files, CancellationToken ct)
+    {
+        if (!Enabled) throw new PackageException("Package management is disabled");
+        if (!PackageArchive.ValidIdentity(id, version)) throw new PackageException("Use a lowercase package ID and a semantic version such as 1.2.3 or 1.2.3-rc.1");
+        entryAssembly = PackageArchive.SafePath(entryAssembly);
+        var archive = PackageArchive.Build(files, entryAssembly);
+        var digest = PackageArchive.Hash(archive);
+        var temporary = Path.Combine(Path.GetTempPath(), "runner-package-inspect-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporary);
+        try
+        {
+            PackageArchive.Extract(archive, temporary);
+            var inspected = PackageArchive.Inspect(temporary, entryAssembly, entryType);
+            try { entryType = inspected.EntryType.FullName!; }
+            finally { inspected.Context.Unload(); }
+        }
+        finally { TryDelete(temporary); }
+        await using var db = await factory.CreateDbContextAsync(ct);
+        var existing = await db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
+            .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc)).SingleOrDefaultAsync(ct);
+        if (existing is not null)
+        {
+            if (existing.Digest == digest && existing.EntryAssembly == entryAssembly && existing.EntryType == entryType) return existing;
+            throw new PackageConflictException("This package version is immutable. Upload changed content under a new version.");
+        }
+        var package = new PluginPackage { PackageId = id, Version = version, EntryAssembly = entryAssembly, EntryType = entryType!, Digest = digest, Archive = archive };
+        // Channel creation is separate and idempotent so concurrent version installs do not overwrite activation state.
+        if (!await db.PluginChannels.AnyAsync(x => x.PackageId == id, ct))
+        {
+            db.PluginChannels.Add(new PluginChannel { PackageId = id });
+            try { await db.SaveChangesAsync(ct); }
+            catch (DbUpdateException)
+            {
+                db.ChangeTracker.Clear();
+                if (!await db.PluginChannels.AnyAsync(x => x.PackageId == id, ct)) throw;
+            }
+        }
+        db.PluginPackages.Add(package);
+        try { await db.SaveChangesAsync(ct); }
+        catch (DbUpdateException)
+        {
+            db.ChangeTracker.Clear();
+            var winner = await db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
+                .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc)).SingleOrDefaultAsync(ct);
+            if (winner is null) throw;
+            if (winner.Digest == digest && winner.EntryAssembly == entryAssembly && winner.EntryType == entryType) return winner;
+            throw new PackageConflictException("This package version already exists with different content");
+        }
+        return new(id, version, entryAssembly, entryType!, digest, package.InstalledUtc);
+    }
+    public async Task<bool> SetChannelAsync(string id, string? version, bool enabled, int revision, CancellationToken ct, string actor = "operator")
+    {
+        if (!Enabled) throw new PackageException("Package management is disabled");
+        await using var db = await factory.CreateDbContextAsync(ct);
+        if (enabled && (version is null || !await db.PluginPackages.AnyAsync(x => x.PackageId == id && x.Version == version, ct)))
+            throw new PackageException("Select an installed package version to activate");
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        var previous = await db.PluginChannels.AsNoTracking().SingleOrDefaultAsync(x => x.PackageId == id, ct);
+        if (previous is null || previous.Revision != revision) return false;
+        var targetVersion = enabled ? version : previous.ActiveVersion;
+        var changed = await db.PluginChannels.Where(x => x.PackageId == id && x.Revision == revision)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.ActiveVersion, targetVersion).SetProperty(x => x.Enabled, enabled)
+                .SetProperty(x => x.Revision, x => x.Revision + 1).SetProperty(x => x.ChangedUtc, DateTime.UtcNow), ct) == 1;
+        if (!changed) return false;
+        db.PackageChanges.Add(new PackageChange { PackageId = id, PreviousVersion = previous.ActiveVersion, Version = targetVersion,
+            Enabled = enabled, Revision = revision + 1, Actor = actor.Length > 120 ? actor[..120] : actor });
+        await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
+        return true;
+    }
+    public async Task<PluginRequest> PinAsync(JsonElement payload, CancellationToken ct)
+    {
+        if (!Enabled) throw new PackageException("Package execution is disabled");
+        PluginRequest request;
+        try { request = payload.Deserialize<PluginRequest>(JsonSerializerOptions.Web) ?? throw new PackageException("Invalid package request"); }
+        catch (JsonException) { throw new PackageException("Invalid package request"); }
+        if (string.IsNullOrWhiteSpace(request.PackageId) || request.Payload.ValueKind != JsonValueKind.Object)
+            throw new PackageException("Package ID and JSON object payload are required");
+        await using var db = await factory.CreateDbContextAsync(ct);
+        var channel = await db.PluginChannels.AsNoTracking().SingleOrDefaultAsync(x => x.PackageId == request.PackageId, ct);
+        if (channel is null || !channel.Enabled) throw new PackageException("Package is not enabled");
+        var version = request.Version ?? channel.ActiveVersion;
+        if (version is null || !await db.PluginPackages.AnyAsync(x => x.PackageId == request.PackageId && x.Version == version, ct))
+            throw new PackageException("Package version not installed");
+        return request with { Version = version };
+    }
+    public async Task<(string Directory, PackageInfo Info)> MaterializeAsync(string id, string version, CancellationToken ct)
+    {
+        await using var db = await factory.CreateDbContextAsync(ct);
+        var info = await db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
+            .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc)).SingleOrDefaultAsync(ct)
+            ?? throw new PackageException("Pinned plugin package is unavailable");
+        var root = Path.GetFullPath(options.Value.CacheDirectory);
+        var destination = Path.Combine(root, info.Digest);
+        // Verify the archive and materialize to a unique directory per execution. No shared mutable DLL files.
+        var archive = await db.PluginPackages.Where(x => x.PackageId == id && x.Version == version).Select(x => x.Archive).SingleAsync(ct);
+        if (PackageArchive.Hash(archive) != info.Digest) throw new PackageException("Package integrity check failed");
+        RejectLinks(root);
+        Directory.CreateDirectory(root);
+        destination += "-" + Guid.NewGuid().ToString("N");
+        Directory.CreateDirectory(destination);
+        try { PackageArchive.Extract(archive, destination); return (destination, info); }
+        catch { TryDelete(destination); throw; }
+    }
+    private static void RejectLinks(string root)
+    {
+        for (var directory = new DirectoryInfo(root); directory is not null; directory = directory.Parent)
+            if (directory.LinkTarget is not null) throw new PackageException("Package cache must not use symlink/reparse-point directories");
+    }
+    public static void TryDelete(string directory)
+    {
+        try { Directory.Delete(directory, recursive: true); }
+        catch (IOException) { /* Windows may retain DLL mappings until the collectible context is collected. */ }
+        catch (UnauthorizedAccessException) { }
+    }
+}
+
+public sealed class PackageJobHandler(PackageManager packages, IServiceProvider services) : IJobHandler
+{
+    public const string JobType = "runner.plugin";
+    public string Type => JobType;
+    public async Task ExecuteAsync(JobContext context, CancellationToken ct)
+    {
+        if (!packages.Enabled) throw new JobExecutionException("package_execution_disabled");
+        var request = JsonSerializer.Deserialize<PluginRequest>(context.Payload, JsonSerializerOptions.Web)
+            ?? throw new JobExecutionException("invalid_package_job");
+        if (request.Version is null) throw new JobExecutionException("package_version_not_pinned");
+        var materialized = await packages.MaterializeAsync(request.PackageId, request.Version, ct);
+        PluginLoadContext? loadContext = null;
+        try
+        {
+            var entry = PackageArchive.Inspect(materialized.Directory, materialized.Info.EntryAssembly, materialized.Info.EntryType);
+            loadContext = entry.Context;
+            var plugin = (IRunnerPlugin)ActivatorUtilities.CreateInstance(services, entry.EntryType);
+            try { await plugin.ExecuteAsync(context with { Payload = request.Payload.GetRawText() }, ct); }
+            finally
+            {
+                if (plugin is IAsyncDisposable asyncDisposable) await asyncDisposable.DisposeAsync();
+                else if (plugin is IDisposable disposable) disposable.Dispose();
+            }
+        }
+        finally { loadContext?.Unload(); PackageManager.TryDelete(materialized.Directory); }
+    }
+}

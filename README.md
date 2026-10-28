@@ -8,10 +8,16 @@ A plugin-based durable worker with an operations dashboard, built with .NET 10 a
 
 Real screenshots captured from the running application. The function registry is enabled for these screenshots.
 
+![Plugin package manager](docs/images/package-manager.png)
+
 ![Runner operations dashboard](docs/images/dashboard.png)
 
 <details>
-<summary>C# function registry and persisted job results</summary>
+<summary>Package history, functions, operations, and job results</summary>
+
+![Plugin activation and rollback history](docs/images/package-history.png)
+
+[View the mobile package manager](docs/images/package-manager-mobile.png)
 
 ![Ready-to-run database and application operations](docs/images/ready-operations.png)
 
@@ -70,7 +76,103 @@ Retries use bounded exponential backoff with jitter, with a maximum of 20 attemp
 
 The scheduler uses fixed UTC intervals of at least 10 seconds. It does not provide cron or time zone scheduling. Missed ticks coalesce into one job; schedule advancement and enqueueing commit in a single transaction. Deleting a schedule does not remove jobs already queued. Keep all host clocks synchronized with NTP; lease checks use the application's UTC clock.
 
-## Writing a plugin
+## Dashboard plugin package manager
+
+Install and operate plugins directly from the dashboard. Choose **DLLs and dependencies** or **a folder** from anywhere on your computer, select the entry DLL, enter a package ID/version, and click **Validate & install version**. Source files do not need to be in Runner's `plugins` directory or anywhere on the server beforehand. Folder selection uses the browser's directory upload capability; browsers without it can use multi-file selection. Files are uploaded as a snapshot rather than linked to their original location.
+
+The entry point must implement **`IRunnerPlugin`** from `Runner.Contracts`. Installation checks the managed DLL, loads its declared managed dependencies, and verifies the entry type. If the DLL exposes several implementations, provide the full entry type name. An arbitrary DLL or a legacy `IJobHandler` alone is not a dashboard package entry point. Package installation does not invoke the entry constructor; execution creates it with scoped dependency injection. Constructor dependencies must be available in the host.
+
+### Author a package
+
+Create a .NET 10 class library and reference the host contract. Use `Runner.SamplePlugin.csproj` and `EchoPlugin.cs` as the working example. A project reference should exclude the contract from runtime output:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Runner.Contracts/Runner.Contracts.csproj"
+                      Private="false" ExcludeAssets="runtime" />
+  </ItemGroup>
+</Project>
+```
+
+```csharp
+using System.Text.Json;
+using Runner.Contracts;
+
+public sealed class InvoicePlugin : IRunnerPlugin
+{
+    public async Task ExecuteAsync(JobContext context, CancellationToken ct)
+    {
+        using var input = JsonDocument.Parse(context.Payload);
+        var invoiceId = input.RootElement.GetProperty("invoiceId").GetString();
+        await Task.Delay(100, ct); // Replace with idempotent business work.
+        context.ReportResult?.Invoke(JsonSerializer.Serialize(new { invoiceId, processed = true }));
+    }
+}
+```
+
+Produce the sample package folder:
+
+```bash
+dotnet publish src/Runner.SamplePlugin -c Release -o artifacts/sample-package
+```
+
+Upload that output folder from the dashboard and select `Runner.SamplePlugin.dll`; its entry type is `Runner.SamplePlugin.EchoPlugin`. Supply dependent DLLs, `.deps.json`, native runtime assets and resources as needed. Exclude `Runner.Contracts.dll`, which is shared with the host. Framework and `Microsoft.Extensions.*` dependencies must be compatible with the host; a package does not install a new .NET runtime or restore NuGet dependencies remotely. Managed dependency loading is checked at installation; native imports and business behavior are validated when the plugin runs. Deploy native dependencies for the worker OS, and use compatible/homogeneous worker pools for platform-specific packages; automatic OS/capability routing is not implemented.
+
+### Version and lifecycle behavior
+
+- Package IDs are lowercase identifiers (up to 48 characters); versions use `major.minor.patch` with an optional prerelease suffix, such as `1.2.3-rc.1` (up to 64 characters).
+- Every `(packageId, version)` stores an immutable archive, entry point and SHA-256 digest in Runner's shared database. An identical upload is repeatable; changed files under the same version return 409. Install changes under a new version. File ordering and source folder names do not affect the digest.
+- **Activate / rollback** changes the active version immediately for future submissions that omit a version. No host restart, OS service creation, or editing a fixed plugin path is needed. Older installed versions remain available.
+- Jobs and schedules pin a version at creation. An active-version change does not change queued work or retries. You can explicitly select an installed version for a run while the package is enabled.
+- **Disable** pauses new job claims and schedule ticks for that package. Pending jobs retain their attempt count; running jobs finish. Re-enabling resumes pending work and coalesces missed schedule ticks. Disabling keeps the previous active version for inspection and reactivation.
+- State changes require the current channel revision. Stale concurrent changes return 409; refresh and retry. Activation history stores previous/new versions, enabled state, revision, timestamp and operator identity. Built-in authentication currently identifies the shared operator account, rather than individual people.
+- Installed versions are retained so pinned jobs and schedules remain reproducible. Automatic package deletion/retention and a remote NuGet marketplace are not implemented.
+
+Select a version to **Queue plugin job** or **Create schedule** in the same panel. The plugin receives the inner JSON payload and the normal job ID, attempt, cancellation token, result sink and centralized log callback. Existing retries, execution records, reports and terminal alerts apply automatically.
+
+API job example (omit `version` to resolve and pin the current active version at submission):
+
+```json
+{
+  "type": "runner.plugin",
+  "payload": {
+    "packageId": "company.invoice",
+    "version": "1.2.3",
+    "payload": { "invoiceId": "INV-001" }
+  },
+  "maxAttempts": 3
+}
+```
+
+Use the same wrapper payload with `/api/schedules`. Specify a version when replaying an idempotent API request across activation changes; a reused enqueue key with a newly resolved version is a different job request.
+
+### Storage, limits, and trust
+
+Uploads accept at most 512 files / 50 MiB, with a 64 MiB multipart request limit, and six install requests per minute per host. Paths must be relative and portable; traversal, symlinks, case-colliding file names, Windows reserved names and a bundled contract copy are rejected. There is no endpoint that executes an arbitrary server filesystem DLL path.
+
+Package metadata and bytes are shared through the job database; API and worker replicas do not need a shared source folder. Every execution verifies the stored archive digest, materializes a unique local working directory, and uses a collectible assembly load context. Configure a writable `Packages__CacheDirectory` (default `data/package-cache`) on each worker. Entry instances are disposed when supported. Unload and directory deletion are best effort: native code, static references, or background threads can retain mappings; Windows may retain DLL files until collection or process exit. Clean stale working directories while workers are stopped. Large archives incur database transfer and extraction costs on each execution; benchmark your package sizes and concurrency before production. There is no automatic restart or service registration.
+
+Only trusted operators may install reviewed packages. Plugin code has the host process's privileges and can access its resources. Interface validation and a digest are compatibility/integrity checks, not publisher authentication or a sandbox. Constructor/entry code, native imports, and background threads remain the author's responsibility. SHA-256 does not protect against a database administrator replacing both archive and digest. Keep the cache directory restricted to the worker identity; symlink/reparse-point cache ancestors are rejected. Use a separate constrained process/container for untrusted plugins.
+
+Set `Packages__Enabled=false` to disable package APIs/execution on a host; keep this setting consistent across replicas. Per-package enable/disable and rollback are live dashboard operations. No Windows Service/SCM integration is installed or required by the package manager.
+
+Existing databases need the explicit version 4 upgrade, with workers stopped and a backup available:
+
+```bash
+dotnet Runner.Host.dll --upgrade-packages
+```
+
+It applies earlier upgrades as needed, adds package versions/channels/history and nullable package references on jobs/schedules, and is safe to rerun. Fresh database bootstrap includes the tables; `scripts/dev.sh` handles the upgrade locally.
+
+## Legacy configured handlers
 
 Create a .NET 10 class library that references `Runner.Contracts`:
 
@@ -86,7 +188,7 @@ public sealed class InvoiceHandler : IJobHandler
 }
 ```
 
-Deploy the plugin with its dependency DLLs and `.deps.json` file. Configure an explicit allowlist such as `Plugins__0=plugins/YourPlugin.dll`; paths are relative to the executable directory. Do not load a separate copy of the shared `Runner.Contracts.dll` from the plugin directory. Use `Runner.SamplePlugin.csproj` as an example. Concrete handler types are created through scoped dependency injection and can receive framework services. Extend the host composition root to register additional services. Every worker in a deployment must use consistent `Type` identifiers; duplicate types prevent startup. Plugins require a rolling deployment to update; hot reload is not supported. Version payload contracts, and keep old handlers available while jobs for those versions remain queued. Plugins are responsible for validating their payloads.
+Deploy the plugin with its dependency DLLs and `.deps.json` file. Configure an explicit allowlist such as `Plugins__0=plugins/YourPlugin.dll`; paths are relative to the executable directory. Do not load a separate copy of the shared `Runner.Contracts.dll` from the plugin directory. Use `Runner.SamplePlugin.csproj` as an example. Concrete handler types are created through scoped dependency injection and can receive framework services. Extend the host composition root to register additional services. Every worker in a deployment must use consistent `Type` identifiers; duplicate types prevent startup. These legacy configured handlers require a rolling deployment to update. Use dashboard packages with IRunnerPlugin for live installation, activation and rollback. Version payload contracts, and keep old handlers available while jobs for those versions remain queued. Plugins are responsible for validating their payloads.
 
 ## Ready-to-run database and application jobs
 
@@ -212,10 +314,10 @@ Delivery uses a leased DB outbox across replicas, a 10-second request timeout, e
 Existing databases must be backed up and upgraded with workers stopped:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-operations
+dotnet Runner.Host.dll --upgrade-packages
 ```
 
-This applies the version 2 function upgrade when needed and the version 3 attempt/log/alert tables, preserves existing jobs/functions, and records applied versions. It is safe to rerun. Fresh databases include the new tables; the development script handles bootstrap/upgrade. Use a separate DDL deployment identity, then run with a restricted DML identity.
+This applies the version 2 functions, version 3 attempt/log/alert tables and version 4 package management tables when needed, preserves existing jobs/functions, and records applied versions. It is safe to rerun. Fresh databases include the new tables; the development script handles bootstrap/upgrade. Use a separate DDL deployment identity, then run with a restricted DML identity.
 
 ## Database-registered C# functions (Roslyn)
 
@@ -225,7 +327,7 @@ Enable scripting explicitly on **all** participating API and worker instances:
 Scripting__Enabled=true bash scripts/dev.sh
 ```
 
-The development script initializes a fresh database or applies the version 2/3 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
+The development script initializes a fresh database or applies the version 2/3/4 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
 
 Use **C# function registry** in the dashboard to compile and register a named version, inspect compilation diagnostics, select the registered version, supply JSON arguments, and queue a run. Use **Details** in job activity to inspect the persisted JSON result. The registry supports pagination, viewing source, and enabling or disabling versions.
 
@@ -287,6 +389,13 @@ All `/api/*` requests require an operator cookie or `X-Runner-Key`. Mutations al
 
 | Method | Path | Operation |
 | --- | --- | --- |
+| GET | `/api/packages/settings` | Package feature and upload limits |
+| GET | `/api/packages?page=0` | List 50 package channels per page |
+| POST | `/api/packages/install` | Multipart files + packageId, version, entryAssembly, optional entryType |
+| GET | `/api/packages/{id}/channel` | Current enabled state, active version and revision |
+| GET | `/api/packages/{id}/versions?page=0` | Immutable version metadata (no archive bytes) |
+| GET | `/api/packages/{id}/history?page=0` | Activation and rollback history |
+| POST | `/api/packages/{id}/activation` | Set version/enabled with expected revision |
 | GET | `/api/resources` | List safe resource metadata and webhook configuration status |
 | GET | `/api/jobs/{id}/logs?page=0` | List 100 centralized log entries per page |
 | GET | `/api/jobs/{id}/attempts` | Inspect up to 100 latest execution attempts |
@@ -323,6 +432,8 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 
 | Setting | Default / purpose |
 | --- | --- |
+| `Packages__Enabled` | true; enable dashboard package management and execution |
+| `Packages__CacheDirectory` | `data/package-cache`; writable worker-local materialization directory |
 | `Operations__Connections__<name>__Provider` | `Postgres` or `Mssql` for business commands; independent of Runner storage |
 | `Operations__Connections__<name>__ConnectionString` | Secret DSN, never stored in a job payload |
 | `Operations__Applications__<name>__FileName` | Allowlisted absolute executable path |
@@ -361,13 +472,13 @@ docker compose up --build -d
 
 Compose runs one initialization job after PostgreSQL passes its health check, then starts Runner. PostgreSQL's port is not published to the host; Runner binds only to 127.0.0.1. In production, place a TLS reverse proxy in front of Runner and prevent direct access to the application container. Set `Security__TrustedProxy` to the actual proxy IP. Production cookies require HTTPS; browser login will not work over plain HTTP. You can use loopback HTTP with an API key for health and API smoke checks.
 
-For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3 upgrade from the published directory with the correct provider and connection string:
+For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3/4 upgrade from the published directory with the correct provider and connection string:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-operations
+dotnet Runner.Host.dll --upgrade-packages
 ```
 
-The upgrade adds the function registry, nullable job result column, execution journal, and alert outbox; it preserves existing jobs and schedules, records schema versions 2 and 3, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
+The upgrade adds the function registry, nullable job result column, execution journal, alert outbox, and plugin package registry; it preserves existing jobs and schedules, records schema versions 2, 3 and 4, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
 
 Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating the API key does not immediately revoke existing eight-hour cookies: immediate session revocation requires cookie key ring rotation or an additional authentication revocation mechanism. Built-in authentication has a single operator role; multi-user RBAC and audit requirements need an OIDC gateway and centralized audit integration. Restrict access before exposing the service to the public internet.
 
@@ -386,6 +497,7 @@ TEST_POSTGRES='Host=localhost;Username=postgres;Password=...' dotnet test tests/
 # With no bindings those two integration checks are explicitly skipped.
 python3 scripts/smoke.py
 SMOKE_SCRIPTING=true SMOKE_OPERATIONS=true python3 scripts/smoke.py
+python3 scripts/package_smoke.py
 # Use an empty database dedicated to testing; the smoke test does not delete it automatically.
 SMOKE_POSTGRES='Host=localhost;Database=runner_smoke;Username=postgres;Password=...' python3 scripts/smoke.py
 dotnet publish src/Runner.Host -c Release -o artifacts/publish
@@ -395,3 +507,5 @@ docker build -t runner:local .
 To regenerate the committed screenshots, start a local instance with scripting enabled and sample data, install Playwright separately from the application, and run `scripts/capture-dashboard.cjs`. It requires Chromium (default `/usr/bin/chromium`, override with `CHROMIUM_PATH`), `RUNNER_SCREENSHOT_URL` for the target instance, and a local operator key file (`RUNNER_KEY_FILE`, default `src/Runner.Host/data/operator.key`). The capture tool creates sample functions and jobs in that instance; use a disposable development database. It never renders or saves the operator key in an image.
 
 Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both Runner storage providers and both business database command providers. SQL Server Developer is used only for development/testing, with test-only plaintext loopback connections; configure encryption and licensing appropriately for production. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.
+
+Package validation also exercises immutable uploads, entry contracts, archive integrity, activation revisions, pause/resume, version-pinned jobs/schedules, rollback/history, and repeatable version 4 upgrades. Run `scripts/package_smoke.py` with `SMOKE_POSTGRES` for PostgreSQL job storage. Optional `scripts/package_browser.cjs` uses Playwright/Chromium to select files and a folder outside the application tree, install and run two versions live, disable/roll back, and capture package manager screenshots. Use a disposable development instance and `RUNNER_SCREENSHOT_URL` / `RUNNER_KEY_FILE` as with the other capture tools.

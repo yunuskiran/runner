@@ -1,5 +1,8 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.EntityFrameworkCore;
 using Runner.Engine;
+using Runner.Engine.Packaging;
+using Microsoft.Extensions.Options;
 using Xunit;
 namespace Runner.Tests;
 
@@ -175,6 +178,83 @@ public sealed class StoreTests : IAsyncLifetime
         await db.Database.ExecuteSqlRawAsync("DROP TABLE \"Attempts\"; DROP TABLE \"JobLogs\"; DROP TABLE \"Alerts\";");
         await SchemaUpgrade.ApplyOperationsAsync(db); await SchemaUpgrade.ApplyOperationsAsync(db);
         Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.Attempts.ToListAsync());
+    }
+    private PackageManager PackageService() => new(factory, Options.Create(new PackageOptions { CacheDirectory = Path.Combine(Path.GetTempPath(), "runner-packages-tests") }));
+    private static PackageFile[] FixtureFiles() => Directory.GetFiles(Path.Combine(AppContext.BaseDirectory, "package-fixture"))
+        .Select(path => new PackageFile(Path.GetFileName(path), File.ReadAllBytes(path))).ToArray();
+    [Fact] public async Task Package_install_is_immutable_and_repeatable()
+    {
+        var packages = PackageService(); var files = FixtureFiles();
+        await Assert.ThrowsAsync<PackageException>(() => packages.InstallAsync("company.echo", "0.1.0", "Runner.SamplePlugin.dll", "Runner.SamplePlugin.EchoHandler", files, default));
+        var first = await packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null, files, default);
+        var again = await packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null, files.Reverse().ToArray(), default);
+        Assert.Equal(first.Digest, again.Digest);
+        Assert.Equal("Runner.SamplePlugin.EchoPlugin", first.EntryType);
+        await Assert.ThrowsAsync<PackageConflictException>(() => packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null,
+            files.Append(new PackageFile("settings.json", "{}"u8.ToArray())).ToArray(), default));
+        await using var db = factory.CreateDbContext(); Assert.Equal(1, await db.PluginPackages.CountAsync());
+    }
+    [Fact] public async Task Package_activation_revision_prevents_lost_updates_and_records_rollback()
+    {
+        var packages = PackageService();
+        foreach (var version in new[] { "1.0.0", "2.0.0" }) await packages.InstallAsync("company.echo", version, "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
+        Assert.True(await packages.SetChannelAsync("company.echo", "1.0.0", true, 0, default));
+        Assert.False(await packages.SetChannelAsync("company.echo", "2.0.0", true, 0, default));
+        Assert.True(await packages.SetChannelAsync("company.echo", "2.0.0", true, 1, default));
+        Assert.True(await packages.SetChannelAsync("company.echo", "1.0.0", true, 2, default));
+        Assert.True(await packages.SetChannelAsync("company.echo", null, false, 3, default));
+        await using var db = factory.CreateDbContext(); var channel = await db.PluginChannels.SingleAsync();
+        Assert.Equal("1.0.0", channel.ActiveVersion); Assert.False(channel.Enabled); Assert.Equal(4, await db.PackageChanges.CountAsync());
+    }
+    [Fact] public async Task Pinned_package_job_waits_while_disabled_and_preserves_version()
+    {
+        var packages = PackageService();
+        foreach (var version in new[] { "1.0.0", "2.0.0" }) await packages.InstallAsync("company.echo", version, "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
+        await packages.SetChannelAsync("company.echo", "1.0.0", true, 0, default);
+        using var input = System.Text.Json.JsonDocument.Parse("{\"packageId\":\"company.echo\",\"payload\":{\"name\":\"test\"}}");
+        var pinned = await packages.PinAsync(input.RootElement, default); Assert.Equal("1.0.0", pinned.Version);
+        await using (var db = factory.CreateDbContext())
+        {
+            db.Jobs.Add(new Job { Type = PackageJobHandler.JobType, PackageId = pinned.PackageId, PackageVersion = pinned.Version,
+                Payload = System.Text.Json.JsonSerializer.Serialize(pinned, System.Text.Json.JsonSerializerOptions.Web), AvailableUtc = now.AddSeconds(-1) });
+            await db.SaveChangesAsync();
+        }
+        await packages.SetChannelAsync("company.echo", "2.0.0", false, 1, default);
+        Assert.Null(await Claim());
+        await packages.SetChannelAsync("company.echo", "2.0.0", true, 2, default);
+        var job = (await Claim())!; Assert.Equal("1.0.0", job.PackageVersion);
+        using var provider = new Microsoft.Extensions.DependencyInjection.ServiceCollection().BuildServiceProvider();
+        var handler = new PackageJobHandler(packages, provider); string? output = null;
+        await handler.ExecuteAsync(new Runner.Contracts.JobContext(job.Id, job.Payload, job.Attempts) { ReportResult = json => output = json }, default);
+        Assert.Contains("Hello, test!", output!, StringComparison.Ordinal);
+    }
+    [Fact] public async Task Disabled_package_schedules_do_not_dispatch_or_advance()
+    {
+        var packages = PackageService(); await packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
+        await using (var db = factory.CreateDbContext())
+        {
+            db.Schedules.Add(new Schedule { Type = PackageJobHandler.JobType, PackageId = "company.echo", PackageVersion = "1.0.0", IntervalSeconds = 60, NextUtc = now.AddHours(-1) });
+            await db.SaveChangesAsync();
+        }
+        Assert.Equal(0, await store.DispatchSchedulesAsync(now, default));
+        await packages.SetChannelAsync("company.echo", "1.0.0", true, 0, default);
+        var disabledStore = new JobStore(factory, Options.Create(new PackageOptions { Enabled = false }));
+        Assert.Equal(0, await disabledStore.DispatchSchedulesAsync(now, default));
+        Assert.Equal(1, await store.DispatchSchedulesAsync(now, default));
+        await using var verify = factory.CreateDbContext(); Assert.Equal("1.0.0", (await verify.Jobs.SingleAsync()).PackageVersion);
+    }
+    [Fact] public async Task Package_upgrade_preserves_existing_jobs_and_is_repeatable()
+    {
+        var job = await Add(); await using var db = factory.CreateDbContext();
+        await db.Database.ExecuteSqlRawAsync("DROP TABLE \"PluginPackages\"; DROP TABLE \"PluginChannels\"; DROP TABLE \"PackageChanges\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageVersion\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageVersion\";");
+        await SchemaUpgrade.ApplyPackagesAsync(db); await SchemaUpgrade.ApplyPackagesAsync(db);
+        Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.PluginPackages.Select(x => x.PackageId).ToListAsync());
+    }
+    [Fact] public async Task Corrupt_package_archive_is_rejected_at_execution()
+    {
+        var packages = PackageService(); await packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
+        await using (var db = factory.CreateDbContext()) await db.PluginPackages.ExecuteUpdateAsync(s => s.SetProperty(x => x.Archive, new byte[] { 1, 2, 3 }));
+        await Assert.ThrowsAsync<PackageException>(() => packages.MaterializeAsync("company.echo", "1.0.0", default));
     }
     private sealed class TestFactory(DbContextOptions<RunnerDb> options) : IDbContextFactory<RunnerDb>
     { public RunnerDb CreateDbContext() => new(options); }

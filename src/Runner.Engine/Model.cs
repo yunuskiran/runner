@@ -1,10 +1,13 @@
 using Microsoft.EntityFrameworkCore;
+using Runner.Engine.Packaging;
 namespace Runner.Engine;
 
 public enum JobState { Pending, Running, Succeeded, DeadLetter, Cancelled }
 
 public sealed class Job
 {
+    public string? PackageId { get; set; }
+    public string? PackageVersion { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Type { get; set; } = "";
     public string Payload { get; set; } = "{}";
@@ -25,6 +28,8 @@ public sealed class Job
 
 public sealed class Schedule
 {
+    public string? PackageId { get; set; }
+    public string? PackageVersion { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Type { get; set; } = "";
     public string Payload { get; set; } = "{}";
@@ -37,12 +42,26 @@ public sealed class RunnerDb(DbContextOptions<RunnerDb> options) : DbContext(opt
 {
     public DbSet<Job> Jobs => Set<Job>();
     public DbSet<Schedule> Schedules => Set<Schedule>();
+    public DbSet<PackageChange> PackageChanges => Set<PackageChange>();
+    public DbSet<PluginPackage> PluginPackages => Set<PluginPackage>();
+    public DbSet<PluginChannel> PluginChannels => Set<PluginChannel>();
     public DbSet<ExecutionAttempt> Attempts => Set<ExecutionAttempt>();
     public DbSet<JobLog> JobLogs => Set<JobLog>();
     public DbSet<JobAlert> Alerts => Set<JobAlert>();
     public DbSet<FunctionDefinition> Functions => Set<FunctionDefinition>();
     protected override void OnModelCreating(ModelBuilder b)
     {
+        b.Entity<PackageChange>().HasIndex(x => new { x.PackageId, x.Revision }).IsUnique();
+        b.Entity<PluginPackage>().HasKey(x => new { x.PackageId, x.Version });
+        b.Entity<PluginPackage>().Property(x => x.PackageId).HasMaxLength(48);
+        b.Entity<PluginPackage>().Property(x => x.Version).HasMaxLength(64);
+        b.Entity<PluginChannel>().HasKey(x => x.PackageId);
+        b.Entity<PluginChannel>().Property(x => x.PackageId).HasMaxLength(48);
+        b.Entity<PluginChannel>().Property(x => x.ActiveVersion).HasMaxLength(64);
+        b.Entity<Job>().Property(x => x.PackageId).HasMaxLength(48);
+        b.Entity<Job>().Property(x => x.PackageVersion).HasMaxLength(64);
+        b.Entity<Schedule>().Property(x => x.PackageId).HasMaxLength(48);
+        b.Entity<Schedule>().Property(x => x.PackageVersion).HasMaxLength(64);
         b.Entity<ExecutionAttempt>().HasIndex(x => new { x.JobId, x.StartedUtc });
         b.Entity<ExecutionAttempt>().HasIndex(x => x.StartedUtc);
         b.Entity<JobLog>().HasIndex(x => new { x.JobId, x.TimestampUtc });

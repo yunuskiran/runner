@@ -15,5 +15,5 @@ echo 'Operator key is in src/Runner.Host/data/operator.key (local secret; do not
 dotnet build src/Runner.Host -c Release
 cd src/Runner.Host
 dotnet bin/Release/net10.0/Runner.Host.dll --initialize
-dotnet bin/Release/net10.0/Runner.Host.dll --upgrade-operations
+dotnet bin/Release/net10.0/Runner.Host.dll --upgrade-packages
 exec dotnet bin/Release/net10.0/Runner.Host.dll

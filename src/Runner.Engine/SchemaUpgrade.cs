@@ -61,4 +61,31 @@ public static class SchemaUpgrade
         await transaction.CommitAsync(ct);
     }
 
+    public static async Task ApplyPackagesAsync(RunnerDb db, CancellationToken ct = default)
+    {
+        await ApplyOperationsAsync(db, ct);
+        var pg = db.Database.ProviderName?.Contains("Npgsql", StringComparison.Ordinal) == true;
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.Transaction = transaction.GetDbTransaction();
+        command.CommandText = pg
+            ? "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'PluginPackages'"
+            : "SELECT name FROM sqlite_master WHERE type='table' AND name='PluginPackages'";
+        if (await command.ExecuteScalarAsync(ct) is null)
+        {
+            var resource = $"Runner.Engine.Migrations.004-packages.{(pg ? "postgres" : "sqlite")}.sql";
+            await using var stream = typeof(SchemaUpgrade).Assembly.GetManifestResourceStream(resource)
+                ?? throw new InvalidOperationException("Upgrade resource missing");
+            using var reader = new StreamReader(stream);
+            await db.Database.ExecuteSqlRawAsync(await reader.ReadToEndAsync(ct), ct);
+        }
+        await db.PluginPackages.AsNoTracking().Select(x => x.PackageId).OrderBy(x => x).Take(1).ToListAsync(ct);
+        await db.PackageChanges.AsNoTracking().OrderBy(x => x.Id).Take(1).ToListAsync(ct);
+        await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Take(1).ToListAsync(ct);
+        await db.Jobs.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.PackageId, x.PackageVersion }).Take(1).ToListAsync(ct);
+        await db.Schedules.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.PackageId, x.PackageVersion }).Take(1).ToListAsync(ct);
+        await db.Database.ExecuteSqlRawAsync("INSERT INTO \"__RunnerSchema\" (\"Version\") VALUES (4) ON CONFLICT (\"Version\") DO NOTHING", ct);
+        await transaction.CommitAsync(ct);
+    }
+
 }

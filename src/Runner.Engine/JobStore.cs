@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Runner.Engine.Packaging;
 namespace Runner.Engine;
 
 public interface IJobStore
@@ -9,13 +11,15 @@ public interface IJobStore
 }
 
 /// <summary>All ownership changes use conditional SQL updates; no process-local locks are required.</summary>
-public sealed class JobStore(IDbContextFactory<RunnerDb> factory) : IJobStore
+public sealed class JobStore(IDbContextFactory<RunnerDb> factory, IOptions<PackageOptions>? packages = null) : IJobStore
 {
+    private readonly bool packagesEnabled = packages?.Value.Enabled ?? true;
     public async Task<Job?> ClaimAsync(string worker, DateTime now, TimeSpan lease, CancellationToken ct)
     {
         await using var db = await factory.CreateDbContextAsync(ct);
         await FinalizeExpiredAsync(db, now, false, ct);
         var ids = await db.Jobs.AsNoTracking().Where(x => !x.CancellationRequested && x.Attempts < x.MaxAttempts &&
+            (x.PackageId == null || (packagesEnabled && db.PluginChannels.Any(p => p.PackageId == x.PackageId && p.Enabled))) &&
             ((x.State == JobState.Pending && x.AvailableUtc <= now) ||
              (x.State == JobState.Running && x.LeaseUntilUtc <= now)))
             .OrderBy(x => x.AvailableUtc).Select(x => x.Id).Take(16).ToListAsync(ct);
@@ -24,6 +28,7 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory) : IJobStore
             await using var transaction = await db.Database.BeginTransactionAsync(ct);
             var token = Guid.NewGuid();
             var count = await db.Jobs.Where(x => x.Id == id && !x.CancellationRequested && x.Attempts < x.MaxAttempts &&
+            (x.PackageId == null || (packagesEnabled && db.PluginChannels.Any(p => p.PackageId == x.PackageId && p.Enabled))) &&
                 ((x.State == JobState.Pending && x.AvailableUtc <= now) || (x.State == JobState.Running && x.LeaseUntilUtc <= now)))
                 .ExecuteUpdateAsync(s => s.SetProperty(x => x.State, JobState.Running)
                     .SetProperty(x => x.LeaseToken, token).SetProperty(x => x.LeaseUntilUtc, now + lease)
@@ -77,16 +82,17 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory) : IJobStore
     public async Task<int> DispatchSchedulesAsync(DateTime now, CancellationToken ct)
     {
         await using var db = await factory.CreateDbContextAsync(ct);
-        var due = await db.Schedules.AsNoTracking().Where(x => x.Enabled && x.NextUtc <= now).OrderBy(x => x.NextUtc).Take(50).ToListAsync(ct);
+        var due = await db.Schedules.AsNoTracking().Where(x => x.Enabled && x.NextUtc <= now && (x.PackageId == null || (packagesEnabled && db.PluginChannels.Any(p => p.PackageId == x.PackageId && p.Enabled)))).OrderBy(x => x.NextUtc).Take(50).ToListAsync(ct);
         int count = 0;
         foreach (var schedule in due)
         {
             await using var tx = await db.Database.BeginTransactionAsync(ct);
             // Coalesce missed ticks into one job. The compare-and-swap and insert commit together.
-            if (await db.Schedules.Where(x => x.Id == schedule.Id && x.Enabled && x.NextUtc == schedule.NextUtc)
+            if (await db.Schedules.Where(x => x.Id == schedule.Id && x.Enabled && x.NextUtc == schedule.NextUtc &&
+                (x.PackageId == null || (packagesEnabled && db.PluginChannels.Any(p => p.PackageId == x.PackageId && p.Enabled))))
                 .ExecuteUpdateAsync(s => s.SetProperty(x => x.NextUtc, now.AddSeconds(schedule.IntervalSeconds)), ct) == 1)
             {
-                db.Jobs.Add(new Job { Type = schedule.Type, Payload = schedule.Payload,
+                db.Jobs.Add(new Job { Type = schedule.Type, Payload = schedule.Payload, PackageId = schedule.PackageId, PackageVersion = schedule.PackageVersion,
                     IdempotencyKey = $"schedule:{schedule.Id}:{schedule.NextUtc.Ticks}", AvailableUtc = now });
                 await db.SaveChangesAsync(ct);
                 count++;

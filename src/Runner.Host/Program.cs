@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 using Runner.Engine;
+using Runner.Engine.Packaging;
 using Runner.Host;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -66,6 +67,11 @@ if (builder.Configuration.GetValue<bool>("Scripting:Enabled"))
     builder.Services.AddScoped<ScriptFunctionHandler>();
     builder.Services.AddScoped<Runner.Contracts.IJobHandler>(s => s.GetRequiredService<ScriptFunctionHandler>());
 }
+builder.Services.Configure<PackageOptions>(builder.Configuration.GetSection("Packages"));
+builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(o => o.MultipartBodyLengthLimit = 64 * 1024 * 1024);
+builder.Services.AddSingleton<PackageManager>();
+builder.Services.AddScoped<PackageJobHandler>();
+builder.Services.AddScoped<Runner.Contracts.IJobHandler>(s => s.GetRequiredService<PackageJobHandler>());
 builder.Services.AddSingleton<JobStore>();
 builder.Services.AddSingleton<IJobStore>(s => s.GetRequiredService<JobStore>());
 PluginLoader.AddPlugins(builder.Services, builder.Configuration.GetSection("Plugins").Get<string[]>()!
@@ -87,6 +93,7 @@ if (builder.Configuration["Security:KeyDirectory"] is { Length: > 0 } keyDir)
 builder.Services.AddRateLimiter(o =>
 {
     o.AddFixedWindowLimiter("login", l => { l.PermitLimit = 10; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; });
+    o.AddFixedWindowLimiter("package-install", l => { l.PermitLimit = 6; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; });
     o.AddFixedWindowLimiter("script-registration", l => { l.PermitLimit = 10; l.Window = TimeSpan.FromMinutes(1); l.QueueLimit = 0; });
 });
 var app = builder.Build();
@@ -103,6 +110,12 @@ if (args.Contains("--schema"))
 {
     await using var db = await factory.CreateDbContextAsync();
     Console.WriteLine(db.Database.GenerateCreateScript()); return;
+}
+if (args.Contains("--upgrade-packages"))
+{
+    await using var db = await factory.CreateDbContextAsync();
+    await SchemaUpgrade.ApplyPackagesAsync(db);
+    Console.WriteLine("Schema version 4 verified: plugin package management is available."); return;
 }
 if (args.Contains("--upgrade-operations"))
 {
@@ -156,6 +169,8 @@ app.MapGet("/health/live", () => Results.Ok(new { status = "alive" }));
 app.MapGet("/health/ready", async (CancellationToken ct) =>
 {
     try { await using var db = await factory.CreateDbContextAsync(ct); _ = await db.Jobs.AsNoTracking().Select(x => x.ResultJson).FirstOrDefaultAsync(ct);
+        _ = await db.Jobs.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.PackageId, x.PackageVersion }).FirstOrDefaultAsync(ct);
+        _ = await db.PluginChannels.AsNoTracking().AnyAsync(ct); _ = await db.PluginPackages.AsNoTracking().AnyAsync(ct); _ = await db.PackageChanges.AsNoTracking().AnyAsync(ct);
         _ = await db.Functions.AsNoTracking().AnyAsync(ct);
         _ = await db.Attempts.AsNoTracking().AnyAsync(ct); _ = await db.JobLogs.AsNoTracking().AnyAsync(ct); _ = await db.Alerts.AsNoTracking().AnyAsync(ct); return Results.Ok(new { status = "ready" }); }
     catch { return Results.StatusCode(503); }
@@ -183,6 +198,7 @@ app.MapGet("/", () => Results.File(Path.Combine(app.Environment.WebRootPath, "in
 var api = app.MapGroup("/api").RequireAuthorization();
 api.MapFunctions();
 api.MapOperations();
+api.MapPackages();
 api.MapPost("/logout", async (HttpContext c) => { await c.SignOutAsync(); return Results.NoContent(); });
 api.MapGet("/handlers", (HandlerCatalog c) => c.Types.Keys.Order());
 api.MapGet("/stats", async (CancellationToken ct) =>
@@ -203,17 +219,21 @@ api.MapGet("/jobs/{id:guid}", async (Guid id, CancellationToken ct) =>
     var job = await db.Jobs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct);
     return job is null ? Results.NotFound() : Results.Ok(job);
 });
-api.MapPost("/jobs", async (SubmitJob input, HandlerCatalog catalog, DatabaseCommands database, ApplicationCommands apps, CancellationToken ct) =>
+api.MapPost("/jobs", async (SubmitJob input, HandlerCatalog catalog, DatabaseCommands database, ApplicationCommands apps, PackageManager packages, CancellationToken ct) =>
 {
     if (!ValidInput(input.Type, input.Payload, catalog) || !OperationEndpoints.ValidPayload(input.Type, input.Payload, database, apps) || input.MaxAttempts is < 1 or > 20 || input.IdempotencyKey?.Length > 160 ||
         input.DelaySeconds is < 0 or > 31536000 || input.IdempotencyKey?.StartsWith("schedule:", StringComparison.Ordinal) == true)
         return Results.BadRequest(new { error = "Invalid handler, payload, attempt limit, delay or idempotency key" });
     await using var db = await factory.CreateDbContextAsync(ct);
     if (!await FunctionEndpoints.ValidPayloadAsync(input.Type, input.Payload, db, ct)) return Results.BadRequest(new { error = "Invalid or disabled function version / arguments" });
+    PluginRequest? plugin = null;
+    try { if (input.Type == PackageJobHandler.JobType) plugin = await packages.PinAsync(input.Payload, ct); }
+    catch (PackageException e) { return Results.BadRequest(new { error = e.Message }); }
+    var normalizedPayload = plugin is null ? input.Payload.GetRawText() : JsonSerializer.Serialize(plugin, JsonSerializerOptions.Web);
     var key = string.IsNullOrWhiteSpace(input.IdempotencyKey) ? null : input.IdempotencyKey;
     if (key is not null && await db.Jobs.AsNoTracking().SingleOrDefaultAsync(x => x.IdempotencyKey == key, ct) is { } existing)
-        return existing.Type == input.Type && existing.Payload == input.Payload.GetRawText() ? Results.Ok(existing) : Results.Conflict(new { error = "Key already used with a different job" });
-    var job = new Job { Type = input.Type, Payload = input.Payload.GetRawText(), MaxAttempts = input.MaxAttempts,
+        return existing.Type == input.Type && existing.Payload == normalizedPayload ? Results.Ok(existing) : Results.Conflict(new { error = "Key already used with a different job" });
+    var job = new Job { Type = input.Type, Payload = normalizedPayload, PackageId = plugin?.PackageId, PackageVersion = plugin?.Version, MaxAttempts = input.MaxAttempts,
         AvailableUtc = DateTime.UtcNow.AddSeconds(input.DelaySeconds), IdempotencyKey = key };
     db.Jobs.Add(job);
     try { await db.SaveChangesAsync(ct); }
@@ -244,12 +264,15 @@ api.MapPost("/jobs/{id:guid}/retry", async (Guid id, CancellationToken ct) =>
 });
 api.MapGet("/schedules", async (CancellationToken ct) =>
 { await using var db = await factory.CreateDbContextAsync(ct); return await db.Schedules.AsNoTracking().OrderBy(x => x.NextUtc).Take(100).ToListAsync(ct); });
-api.MapPost("/schedules", async (SubmitSchedule input, HandlerCatalog catalog, DatabaseCommands database, ApplicationCommands apps, CancellationToken ct) =>
+api.MapPost("/schedules", async (SubmitSchedule input, HandlerCatalog catalog, DatabaseCommands database, ApplicationCommands apps, PackageManager packages, CancellationToken ct) =>
 {
     if (!ValidInput(input.Type, input.Payload, catalog) || !OperationEndpoints.ValidPayload(input.Type, input.Payload, database, apps) || input.IntervalSeconds is < 10 or > 31536000) return Results.BadRequest();
     await using var db = await factory.CreateDbContextAsync(ct);
     if (!await FunctionEndpoints.ValidPayloadAsync(input.Type, input.Payload, db, ct)) return Results.BadRequest();
-    var schedule = new Schedule { Type = input.Type, Payload = input.Payload.GetRawText(), IntervalSeconds = input.IntervalSeconds, NextUtc = DateTime.UtcNow.AddSeconds(input.IntervalSeconds) };
+    PluginRequest? plugin = null;
+    try { if (input.Type == PackageJobHandler.JobType) plugin = await packages.PinAsync(input.Payload, ct); }
+    catch (PackageException e) { return Results.BadRequest(new { error = e.Message }); }
+    var schedule = new Schedule { PackageId = plugin?.PackageId, PackageVersion = plugin?.Version, Type = input.Type, Payload = plugin is null ? input.Payload.GetRawText() : JsonSerializer.Serialize(plugin, JsonSerializerOptions.Web), IntervalSeconds = input.IntervalSeconds, NextUtc = DateTime.UtcNow.AddSeconds(input.IntervalSeconds) };
     db.Schedules.Add(schedule); await db.SaveChangesAsync(ct); return Results.Created($"/api/schedules/{schedule.Id}", schedule);
 });
 api.MapDelete("/schedules/{id:guid}", async (Guid id, CancellationToken ct) =>
