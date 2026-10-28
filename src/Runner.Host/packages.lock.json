@@ -331,9 +331,6 @@
         "resolved": "9.0.18",
         "contentHash": "1/iz9Eex1TBMYdAk+m3igaMvL+nk+rY1EqL6u93an/j1ghxmB24vGOKXkVFy3NSPA39s1H/+SNoK257tHoXoLA=="
       },
-      "runner.contracts": {
-        "type": "Project"
-      },
       "runner.engine": {
         "type": "Project",
         "dependencies": {
@@ -342,9 +339,12 @@
           "Microsoft.EntityFrameworkCore.SqlServer": "[10.0.14, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[10.0.14, )",
           "Npgsql.EntityFrameworkCore.PostgreSQL": "[10.0.3, )",
-          "Runner.Contracts": "[1.0.0, )",
-          "System.Security.Cryptography.Pkcs": "[10.0.14, )"
+          "System.Security.Cryptography.Pkcs": "[10.0.14, )",
+          "YunusKiran.Runner.PluginSdk": "[0.1.0, )"
         }
+      },
+      "YunusKiran.Runner.PluginSdk": {
+        "type": "Project"
       }
     }
   }

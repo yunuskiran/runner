@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null, resources = null, alertPage = 0, packagesEnabled = false, packagePage = 0, versionPage = 0, selectedPackage = null, selectedPackageVersion = null, packageFiles = [], packageChannels = [];
+let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null, resources = null, alertPage = 0, packagesEnabled = false, packagePage = 0, versionPage = 0, selectedPackage = null, selectedPackageVersion = null, packageFiles = [], packageChannels = [], renderedPolicyKey = null;
 const esc = v => String(v ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 async function api(path, method='GET', body) {
   const r = await fetch('/api'+path, {method, headers:{'Content-Type':'application/json','X-Runner-Request':'1'}, body:body === undefined ? undefined : JSON.stringify(body)});
@@ -131,7 +131,7 @@ $('package-install').onsubmit=e=>{e.preventDefault();act(async()=>{
 },'Plugin package installed.');};
 async function refreshPackages() {
   packageChannels=await api(`/packages?page=${packagePage}`);
-  $('package-list').innerHTML=packageChannels.length?packageChannels.map(p=>`<div class="package-item"><div><strong>${esc(p.packageId)}</strong><small>${p.enabled?'Enabled':'Disabled'} · active ${esc(p.activeVersion||'none')} · revision ${p.revision}</small></div><div><button class="text" data-package="${esc(p.packageId)}" data-package-action="versions">Versions / rollback</button>${p.enabled?`<button class="text" data-package="${esc(p.packageId)}" data-package-action="disable">Disable</button>`:''}</div></div>`).join(''):'<p>No packages installed. Select a DLL or folder above.</p>';
+  $('package-list').innerHTML=packageChannels.length?packageChannels.map(p=>`<div class="package-item"><div><strong>${esc(p.packageId)}</strong><small>${p.enabled?'Enabled':'Disabled'} · ${esc(p.executionMode)} · active ${esc(p.activeVersion||'none')} · revision ${p.revision}</small></div><div><button class="text" data-package="${esc(p.packageId)}" data-package-action="versions">Versions / rollback</button>${p.enabled?`<button class="text" data-package="${esc(p.packageId)}" data-package-action="disable">Disable</button>`:''}</div></div>`).join(''):'<p>No packages installed. Select a DLL or folder above.</p>';
   $('packages-page').textContent=`Page ${packagePage+1}`;$('packages-prev').disabled=packagePage===0;$('packages-next').disabled=packageChannels.length<50;
   if(selectedPackage){await refreshPackageVersions();}
 }
@@ -143,8 +143,9 @@ async function currentChannel() {
 async function refreshPackageVersions() {
   const versions=await api(`/packages/${encodeURIComponent(selectedPackage)}/versions?page=${versionPage}`);
   const channel=await currentChannel();
+  const policyKey=`${selectedPackage}:${channel.revision}`;if(renderedPolicyKey!==policyKey){$('package-mode').value=channel.executionMode;renderedPolicyKey=policyKey;}
   $('package-version-panel').hidden=false;$('package-version-title').textContent=`${selectedPackage} · installed versions`;
-  $('package-version-rows').innerHTML=versions.map(v=>`<tr><td><strong>${esc(v.version)}</strong>${channel.activeVersion===v.version?'<small>Active version</small>':''}</td><td>${esc(v.entryAssembly)}<small>${esc(v.entryType)}</small></td><td><small title="${esc(v.digest)}">${esc(v.digest.slice(0,16))}…</small></td><td><button class="text" data-version="${esc(v.version)}" data-version-action="select">Select</button><button class="text" data-version="${esc(v.version)}" data-version-action="activate">${channel.activeVersion===v.version?'Enable / keep active':'Activate / rollback'}</button></td></tr>`).join('');
+  $('package-version-rows').innerHTML=versions.map(v=>`<tr><td><strong>${esc(v.version)}</strong>${channel.activeVersion===v.version?'<small>Active version</small>':''}</td><td>${esc(v.entryAssembly)}<small>${esc(v.entryType)} · default ${esc(v.defaultExecutionMode)}</small></td><td><small title="${esc(v.digest)}">${esc(v.digest.slice(0,16))}…</small></td><td><button class="text" data-version="${esc(v.version)}" data-version-action="select">Select</button><button class="text" data-version="${esc(v.version)}" data-version-action="activate">${channel.activeVersion===v.version?'Enable / keep active':'Activate / rollback'}</button></td></tr>`).join('');
   $('versions-page').textContent=`Page ${versionPage+1}`;$('versions-prev').disabled=versionPage===0;$('versions-next').disabled=versions.length<50;
   $('package-run').disabled=!channel.enabled||!selectedPackageVersion;$('package-schedule').disabled=$('package-run').disabled;
 }
@@ -175,3 +176,8 @@ api('/packages/settings').then(async settings=>{packagesEnabled=settings.enabled
   $('package-status').textContent=settings.enabled?'Trusted packages · upload from anywhere, activate live, and keep older versions for pinned jobs.':'Package management is disabled in host configuration.';
   if(settings.enabled)await refreshPackages();
 }).catch(e=>status(e.message,true));
+
+$('package-mode-save').onclick=()=>act(async()=>{
+  const desiredMode=$('package-mode').value;const channel=await currentChannel();
+  await api(`/packages/${encodeURIComponent(selectedPackage)}/activation`,'POST',{version:channel.activeVersion,enabled:channel.enabled,revision:channel.revision,executionMode:desiredMode});
+},'Cluster execution policy updated.');

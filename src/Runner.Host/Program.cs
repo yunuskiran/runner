@@ -111,6 +111,12 @@ if (args.Contains("--schema"))
     await using var db = await factory.CreateDbContextAsync();
     Console.WriteLine(db.Database.GenerateCreateScript()); return;
 }
+if (args.Contains("--upgrade-concurrency"))
+{
+    await using var db = await factory.CreateDbContextAsync();
+    await SchemaUpgrade.ApplyConcurrencyAsync(db);
+    Console.WriteLine("Schema version 5 verified: cluster-wide plugin concurrency is available."); return;
+}
 if (args.Contains("--upgrade-packages"))
 {
     await using var db = await factory.CreateDbContextAsync();
@@ -170,7 +176,7 @@ app.MapGet("/health/ready", async (CancellationToken ct) =>
 {
     try { await using var db = await factory.CreateDbContextAsync(ct); _ = await db.Jobs.AsNoTracking().Select(x => x.ResultJson).FirstOrDefaultAsync(ct);
         _ = await db.Jobs.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.PackageId, x.PackageVersion }).FirstOrDefaultAsync(ct);
-        _ = await db.PluginChannels.AsNoTracking().AnyAsync(ct); _ = await db.PluginPackages.AsNoTracking().AnyAsync(ct); _ = await db.PackageChanges.AsNoTracking().AnyAsync(ct);
+        _ = await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Select(x => new { x.ExecutionMode, x.ExecutionToken, x.ExecutionLeaseUtc }).FirstOrDefaultAsync(ct); _ = await db.PluginPackages.AsNoTracking().OrderBy(x => x.PackageId).Select(x => x.DefaultExecutionMode).FirstOrDefaultAsync(ct); _ = await db.PackageChanges.AsNoTracking().AnyAsync(ct);
         _ = await db.Functions.AsNoTracking().AnyAsync(ct);
         _ = await db.Attempts.AsNoTracking().AnyAsync(ct); _ = await db.JobLogs.AsNoTracking().AnyAsync(ct); _ = await db.Alerts.AsNoTracking().AnyAsync(ct); return Results.Ok(new { status = "ready" }); }
     catch { return Results.StatusCode(503); }

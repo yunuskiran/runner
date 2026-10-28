@@ -92,6 +92,7 @@ public sealed class RunnerDb(DbContextOptions<RunnerDb> options) : DbContext(opt
 
 public sealed class RunnerOptions
 {
+    public string? InstanceName { get; set; }
     public int Concurrency { get; set; } = 4;
     public int PollMilliseconds { get; set; } = 1000;
     public int LeaseSeconds { get; set; } = 60;

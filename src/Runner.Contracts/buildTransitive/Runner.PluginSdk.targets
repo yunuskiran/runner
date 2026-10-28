@@ -1,0 +1,9 @@
+<Project>
+  <!-- Compile against the SDK; Runner supplies the shared contract assembly at execution time. -->
+  <Target Name="RunnerPluginUseHostContracts" AfterTargets="ResolveReferences">
+    <ItemGroup>
+      <ReferenceCopyLocalPaths Remove="@(ReferenceCopyLocalPaths)" Condition="'%(ReferenceCopyLocalPaths.Filename)' == 'Runner.Contracts'" />
+      <RuntimeCopyLocalItems Remove="@(RuntimeCopyLocalItems)" Condition="'%(RuntimeCopyLocalItems.Filename)' == 'Runner.Contracts'" />
+    </ItemGroup>
+  </Target>
+</Project>

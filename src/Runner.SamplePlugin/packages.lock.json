@@ -2,7 +2,7 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
-      "runner.contracts": {
+      "YunusKiran.Runner.PluginSdk": {
         "type": "Project"
       }
     }

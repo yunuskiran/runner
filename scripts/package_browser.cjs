@@ -50,6 +50,9 @@ const fs=require('node:fs');const path=require('node:path');const os=require('no
   await page.waitForFunction(()=>document.getElementById('package-run').disabled);
   await page.locator('[data-version="1.0.0"][data-version-action="activate"]').click();
   await page.waitForFunction(()=>document.getElementById('package-selected').value.includes('v1.0.0')&&!document.getElementById('package-run').disabled);
+  await page.locator('#package-mode').selectOption('Sequential');
+  await page.locator('#package-mode-save').click();
+  await page.waitForFunction(async()=> (await (await fetch('/api/packages/company.reports/channel')).json()).executionMode==='Sequential');
   const output=path.join(root,'docs/images');fs.mkdirSync(output,{recursive:true});
   await page.locator('#packages').screenshot({path:path.join(output,'package-manager.png')});
   await page.locator('#package-history').click();await page.waitForSelector('#job-detail[open]');

@@ -15,7 +15,7 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
     private static readonly Counter<long> Finished = Meter.CreateCounter<long>("runner.jobs.finished");
     private static readonly Histogram<double> Duration = Meter.CreateHistogram<double>("runner.jobs.duration", "s");
     private readonly RunnerOptions config = options.Value;
-    private readonly string workerId = $"{Environment.MachineName}:{Guid.NewGuid():N}";
+    private readonly string workerId = $"{options.Value.InstanceName ?? Environment.MachineName}:{Guid.NewGuid():N}";
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => !config.WorkerEnabled
         ? Task.CompletedTask : Task.WhenAll(Enumerable.Range(0, config.Concurrency).Select(_ => Loop(stoppingToken)).Append(Scheduler(stoppingToken)));

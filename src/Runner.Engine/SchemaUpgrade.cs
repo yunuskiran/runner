@@ -91,12 +91,38 @@ public static class SchemaUpgrade
             await db.Database.ExecuteSqlRawAsync(await reader.ReadToEndAsync(ct), ct);
         }
         await db.PluginPackages.AsNoTracking().Select(x => x.PackageId).OrderBy(x => x).Take(1).ToListAsync(ct);
-        await db.PackageChanges.AsNoTracking().OrderBy(x => x.Id).Take(1).ToListAsync(ct);
-        await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Take(1).ToListAsync(ct);
+        await db.PackageChanges.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.Id, x.PackageId, x.Version, x.PreviousVersion, x.Enabled, x.Revision, x.TimestampUtc, x.Actor }).Take(1).ToListAsync(ct);
+        await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Select(x => new { x.PackageId, x.ActiveVersion, x.Enabled, x.Revision, x.ChangedUtc }).Take(1).ToListAsync(ct);
         await db.Jobs.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.PackageId, x.PackageVersion }).Take(1).ToListAsync(ct);
         await db.Schedules.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.PackageId, x.PackageVersion }).Take(1).ToListAsync(ct);
         await RecordVersionAsync(db, 4, ct);
         await transaction.CommitAsync(ct);
+    }
+
+
+    public static async Task ApplyConcurrencyAsync(RunnerDb db, CancellationToken ct = default)
+    {
+        await ApplyPackagesAsync(db, ct);
+        var mssql = db.Database.IsSqlServer(); var pg = db.Database.IsNpgsql();
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.Transaction = transaction.GetDbTransaction();
+        command.CommandText = mssql
+            ? "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.PluginChannels') AND name = N'ExecutionMode'"
+            : pg ? "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'PluginChannels' AND column_name = 'ExecutionMode'"
+            : "SELECT name FROM pragma_table_info('PluginChannels') WHERE name = 'ExecutionMode'";
+        if (await command.ExecuteScalarAsync(ct) is null)
+        {
+            var provider = mssql ? "mssql" : pg ? "postgres" : "sqlite";
+            await using var stream = typeof(SchemaUpgrade).Assembly.GetManifestResourceStream($"Runner.Engine.Migrations.005-concurrency.{provider}.sql")
+                ?? throw new InvalidOperationException("Upgrade resource missing");
+            using var reader = new StreamReader(stream);
+            await db.Database.ExecuteSqlRawAsync(await reader.ReadToEndAsync(ct), ct);
+        }
+        await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Take(1).ToListAsync(ct);
+        await db.PluginPackages.AsNoTracking().OrderBy(x => x.PackageId).Select(x => x.DefaultExecutionMode).Take(1).ToListAsync(ct);
+        await db.PackageChanges.AsNoTracking().OrderBy(x => x.Id).Take(1).ToListAsync(ct);
+        await RecordVersionAsync(db, 5, ct); await transaction.CommitAsync(ct);
     }
 
     private static Task<int> RecordVersionAsync(RunnerDb db, int version, CancellationToken ct) => db.Database.IsSqlServer()

@@ -1,7 +1,9 @@
+using Runner.Contracts;
 namespace Runner.Engine.Packaging;
 
 public sealed class PluginPackage
 {
+    public PluginExecutionMode DefaultExecutionMode { get; set; }
     public string PackageId { get; set; } = "";
     public string Version { get; set; } = "";
     public string EntryAssembly { get; set; } = "";
@@ -12,6 +14,9 @@ public sealed class PluginPackage
 }
 public sealed class PluginChannel
 {
+    public PluginExecutionMode ExecutionMode { get; set; }
+    public Guid? ExecutionToken { get; set; }
+    public DateTime? ExecutionLeaseUtc { get; set; }
     public string PackageId { get; set; } = "";
     public string? ActiveVersion { get; set; }
     public bool Enabled { get; set; }
@@ -24,13 +29,15 @@ public sealed class PackageOptions
     public string CacheDirectory { get; set; } = "data/package-cache";
 }
 public sealed record PackageFile(string Path, byte[] Content);
-public sealed record PackageInfo(string PackageId, string Version, string EntryAssembly, string EntryType, string Digest, DateTime InstalledUtc);
+public sealed record PackageInfo(string PackageId, string Version, string EntryAssembly, string EntryType, string Digest, DateTime InstalledUtc, PluginExecutionMode DefaultExecutionMode = PluginExecutionMode.Parallel);
 public sealed record PluginRequest(string PackageId, string? Version, System.Text.Json.JsonElement Payload);
 public sealed class PackageException(string message) : Exception(message);
 public sealed class PackageConflictException(string message) : Exception(message);
 
 public sealed class PackageChange
 {
+    public PluginExecutionMode PreviousExecutionMode { get; set; }
+    public PluginExecutionMode ExecutionMode { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public string PackageId { get; set; } = "";
     public string? PreviousVersion { get; set; }

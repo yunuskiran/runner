@@ -1,1 +1,23 @@
-<Project Sdk="Microsoft.NET.Sdk" />
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <PackageId Condition="'$(RunnerPluginPackageId)' == ''">YunusKiran.Runner.PluginSdk</PackageId>
+    <PackageId Condition="'$(RunnerPluginPackageId)' != ''">$(RunnerPluginPackageId)</PackageId>
+    <VersionPrefix>0.1.0</VersionPrefix>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Authors>yunuskiran</Authors>
+    <Description>Plugin entry contracts and execution policies for the Runner distributed worker.</Description>
+    <PackageTags>runner;worker;plugin;distributed;dotnet</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/yunuskiran/runner</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/yunuskiran/runner</PackageProjectUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="buildTransitive/Runner.PluginSdk.targets" Pack="true" PackagePath="buildTransitive/$(PackageId).targets" />
+  </ItemGroup>
+</Project>

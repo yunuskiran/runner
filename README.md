@@ -76,6 +76,87 @@ Retries use bounded exponential backoff with jitter, with a maximum of 20 attemp
 
 The scheduler uses fixed UTC intervals of at least 10 seconds. It does not provide cron or time zone scheduling. Missed ticks coalesce into one job; schedule advancement and enqueueing commit in a single transaction. Deleting a schedule does not remove jobs already queued. Keep all host clocks synchronized with NTP; lease checks use the application's UTC clock.
 
+## Multiple servers and plugin execution policy
+
+Run multiple Runner hosts against **the same PostgreSQL or SQL Server database**. Every node uses the shared job queue, package archive store, schedules, logs and alert outbox. A conditional claim grants one job lease to one worker; additional servers increase capacity. Install compatible host/plugin versions on every execution node, configure a worker-local package cache, synchronize clocks with NTP, and give each node a distinct `Runner__InstanceName` for readable worker IDs. Share the cookie protection key ring when the dashboard is served behind a load balancer. SQLite remains a local/single-machine option; do not share its file over a network filesystem.
+
+For dashboard-installed plugins, choose a policy per **package ID**, shared across all installed versions:
+
+| Mode | Cluster behavior |
+| --- | --- |
+| `Parallel` | Different jobs can execute concurrently on the same or different servers, within each host's configured concurrency. A single job still has one valid owner. |
+| `Sequential` | Only one valid plugin execution lease can be held for that package ID across the cluster. Different package IDs can still execute concurrently. |
+
+Declare the initial policy in a plugin:
+
+```csharp
+[RunnerPlugin(ExecutionMode = PluginExecutionMode.Sequential)]
+public sealed class InvoicePlugin : IRunnerPlugin
+{
+    public Task ExecuteAsync(JobContext context, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Perform idempotent business work.
+        return Task.CompletedTask;
+    }
+}
+```
+
+An absent attribute defaults to `Parallel`, preserving older plugin behavior. The attribute initializes the channel when a package ID is first installed. Later package uploads do not silently override an operator's policy. The dashboard shows each version's declared default and offers a **Cluster execution mode** selector. Saving a policy uses the current revision and is recorded in activation history. Changing modes while any valid job lease remains returns 409: disable the package, let running jobs drain, change the policy, then enable it again. All nodes must be upgraded to schema/host version 5 before enabling sequential policy; older hosts do not participate in that lease gate.
+
+The sequential gate is a DB row/lease, acquired in the job-claim transaction and renewed with the job heartbeat. Completion/retry releases it atomically. A worker crash leaves the gate until its lease expires, then another node can recover work. Stale tokens cannot renew or finalize the gate or job. Disabling a package pauses new starts and schedule ticks while already claimed jobs can complete.
+
+`Sequential` controls overlap. Eligible jobs are selected by due time, then creation time; a job waiting for its retry backoff or a future due time may allow another due job to run. It is not a dependency workflow that requires one job to succeed before another. Delivery remains at least once. A paused, partitioned, or cancellation-ignoring old process can continue external side effects after losing a lease, so this policy guarantees one **valid lease**, not physical exclusion of arbitrary uncooperative code. Honor cancellation and use idempotency/fencing at the external system for side effects that require stronger protection.
+
+Configure a node:
+
+```bash
+export Runner__InstanceName=worker-a
+export Runner__Concurrency=4
+export Storage__Provider=Mssql
+export Storage__ConnectionString="$RUNNER_SQLSERVER_CONNECTION_STRING"
+```
+
+Use the same database connection on `worker-b` with its own instance name and local cache. `Runner__WorkerEnabled=false` still creates an API/dashboard-only host. Built-in database/process jobs and Roslyn functions retain their normal job lease behavior; the package policy applies to `runner.plugin` jobs.
+
+Existing installations need the explicit, repeatable upgrade with **all workers stopped** and a backup available:
+
+```bash
+dotnet Runner.Host.dll --upgrade-concurrency
+```
+
+It applies earlier upgrades and adds version 5 policy/lease fields while retaining installed versions and defaulting existing channels to `Parallel`. The development script handles this locally.
+
+## NuGet SDK for plugin authors
+
+The contract project builds the **`YunusKiran.Runner.PluginSdk`** NuGet package (initial version `0.1.0`). It contains `IRunnerPlugin`, `JobContext`, `RunnerPluginAttribute`, the execution-mode enum, XML documentation and an MSBuild target that keeps the host-supplied `Runner.Contracts.dll` out of plugin output. The DLL assembly name remains `Runner.Contracts` and its assembly version remains `1.0.0.0` for existing plugins.
+
+Build release artifacts locally:
+
+```bash
+bash scripts/pack-plugin-sdk.sh 0.1.0
+python3 scripts/verify-plugin-sdk.py
+```
+
+Artifacts are `artifacts/nuget/YunusKiran.Runner.PluginSdk.0.1.0.nupkg`, its `.snupkg`, and `checksums.json`. The verifier restores a consumer from a fresh local NuGet cache, publishes it to `artifacts/sdk-consumer`, and checks that it excludes the shared contract. The example project is `samples/Plugin.FromNuGet`; it is outside the main solution so normal solution restore does not depend on a not-yet-published package. Its local-feed demonstration omits a lockfile because the SDK is generated as part of this workflow.
+
+After the SDK is available in your feed, a plugin project references it:
+
+```xml
+<PackageReference Include="YunusKiran.Runner.PluginSdk" Version="0.1.0" PrivateAssets="all" />
+```
+
+Publish the plugin library with .NET 10, then upload its DLL/dependency output through the dashboard. The SDK NuGet package is for authoring plugins; dashboard package versions are the immutable deployed plugin bundles. Include private runtime dependencies and `.deps.json` when uploading those bundles. The SDK package itself is not an executable plugin entry point.
+
+**No package has been published to nuget.org or any external feed.** The package ID is configurable with `RUNNER_PLUGIN_PACKAGE_ID`; feed ownership/name availability and the release license must be reviewed before publication. A feed endpoint and API key can be supplied later. To publish a prepared artifact explicitly:
+
+```bash
+# Set NUGET_API_KEY securely; do not commit or print it.
+bash scripts/publish-plugin-sdk.sh "$NUGET_FEED_ENDPOINT" 0.1.0
+```
+
+The script requires an explicit endpoint and prebuilt artifact, and pushes the `.nupkg` only. The `.snupkg` is retained for a separate symbol-feed release. CI uploads the SDK artifacts for download and does not push them to a feed.
+
 ## Dashboard plugin package manager
 
 Install and operate plugins directly from the dashboard. Choose **DLLs and dependencies** or **a folder** from anywhere on your computer, select the entry DLL, enter a package ID/version, and click **Validate & install version**. Source files do not need to be in Runner's `plugins` directory or anywhere on the server beforehand. Folder selection uses the browser's directory upload capability; browsers without it can use multi-file selection. Files are uploaded as a snapshot rather than linked to their original location.
@@ -158,16 +239,16 @@ Use the same wrapper payload with `/api/schedules`. Specify a version when repla
 
 Uploads accept at most 512 files / 50 MiB, with a 64 MiB multipart request limit, and six install requests per minute per host. Paths must be relative and portable; traversal, symlinks, case-colliding file names, Windows reserved names and a bundled contract copy are rejected. There is no endpoint that executes an arbitrary server filesystem DLL path.
 
-Package metadata and bytes are shared through the job database; API and worker replicas do not need a shared source folder. Every execution verifies the stored archive digest, materializes a unique local working directory, and uses a collectible assembly load context. Configure a writable `Packages__CacheDirectory` (default `data/package-cache`) on each worker. Entry instances are disposed when supported. Unload and directory deletion are best effort: native code, static references, or background threads can retain mappings; Windows may retain DLL files until collection or process exit. Clean stale working directories while workers are stopped. Large archives incur database transfer and extraction costs on each execution; benchmark your package sizes and concurrency before production. There is no automatic restart or service registration.
+Package metadata, execution policy and bytes are shared through the job database; API and worker replicas do not need a shared source folder. Every execution verifies the stored archive digest, materializes a unique local working directory, and uses a collectible assembly load context. Configure a writable `Packages__CacheDirectory` (default `data/package-cache`) on each worker. Entry instances are disposed when supported. Unload and directory deletion are best effort: native code, static references, or background threads can retain mappings; Windows may retain DLL files until collection or process exit. Clean stale working directories while workers are stopped. Large archives incur database transfer and extraction costs on each execution; benchmark your package sizes and concurrency before production. There is no automatic restart or service registration.
 
 Only trusted operators may install reviewed packages. Plugin code has the host process's privileges and can access its resources. Interface validation and a digest are compatibility/integrity checks, not publisher authentication or a sandbox. Constructor/entry code, native imports, and background threads remain the author's responsibility. SHA-256 does not protect against a database administrator replacing both archive and digest. Keep the cache directory restricted to the worker identity; symlink/reparse-point cache ancestors are rejected. Use a separate constrained process/container for untrusted plugins.
 
 Set `Packages__Enabled=false` to disable package APIs/execution on a host; keep this setting consistent across replicas. Per-package enable/disable and rollback are live dashboard operations. No Windows Service/SCM integration is installed or required by the package manager.
 
-Existing databases need the explicit version 4 upgrade, with workers stopped and a backup available:
+Existing databases need the explicit version 5 upgrade, with workers stopped and a backup available:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-packages
+dotnet Runner.Host.dll --upgrade-concurrency
 ```
 
 It applies earlier upgrades as needed, adds package versions/channels/history and nullable package references on jobs/schedules, and is safe to rerun. Fresh database bootstrap includes the tables; `scripts/dev.sh` handles the upgrade locally.
@@ -314,7 +395,7 @@ Delivery uses a leased DB outbox across replicas, a 10-second request timeout, e
 Existing databases must be backed up and upgraded with workers stopped:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-packages
+dotnet Runner.Host.dll --upgrade-concurrency
 ```
 
 This applies the version 2 functions, version 3 attempt/log/alert tables and version 4 package management tables when needed, preserves existing jobs/functions, and records applied versions. It is safe to rerun. Fresh databases include the new tables; the development script handles bootstrap/upgrade. Use a separate DDL deployment identity, then run with a restricted DML identity.
@@ -327,7 +408,7 @@ Enable scripting explicitly on **all** participating API and worker instances:
 Scripting__Enabled=true bash scripts/dev.sh
 ```
 
-The development script initializes a fresh database or applies the version 2/3/4 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
+The development script initializes a fresh database or applies the version 2/3/4/5 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
 
 Use **C# function registry** in the dashboard to compile and register a named version, inspect compilation diagnostics, select the registered version, supply JSON arguments, and queue a run. Use **Details** in job activity to inspect the persisted JSON result. The registry supports pagination, viewing source, and enabling or disabling versions.
 
@@ -448,6 +529,7 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 | `Security__KeyDirectory` | Cookie data protection key directory; use a persistent volume with restricted access |
 | `Security__TrustedProxy` | Optional single reverse proxy IP; forwarded protocol and client IP headers are accepted only from this address |
 | `AllowedHosts` | `localhost;127.0.0.1`; explicitly add the production hostname |
+| `Runner__InstanceName` | Optional readable node name; a unique worker suffix is added per process |
 | `Runner__Concurrency` | 4, allowed range 1–128 |
 | `Runner__PollMilliseconds` | 1000, minimum 100 |
 | `Runner__LeaseSeconds` | 60 |
@@ -477,12 +559,12 @@ From the published application directory, bootstrap a new database/schema or app
 
 ```bash
 dotnet Runner.Host.dll --initialize
-dotnet Runner.Host.dll --upgrade-packages
+dotnet Runner.Host.dll --upgrade-concurrency
 ```
 
 Use the runtime identity with DML access afterward; configure `Security__ApiKey` and start the application as documented. Bootstrap may require database-creation permission; alternatively, have the DBA create an empty database and grant the deployment identity schema DDL access. The existing schema generation command, `dotnet Runner.Host.dll --schema`, emits SQL for the selected provider. SQL Server uses `dbo`, `datetime2(7)` for UTC timestamps, `varbinary(max)` for packages, and binary column collation (`Latin1_General_100_BIN2`) so case-sensitive version/idempotency semantics match the other providers. The unique idempotency index permits multiple null keys.
 
-MSSQL versions of upgrades 2, 3 and 4 are included under `src/Runner.Engine/Migrations/`. Upgrades are explicit and repeatable with workers stopped and a backup available. Selecting a different storage provider points Runner at a different database; it does not transfer existing jobs or packages across providers. Plan and validate that data cutover separately. The supplied Compose preset still uses PostgreSQL; point a published host/container at your SQL Server using the settings above.
+MSSQL versions of upgrades 2, 3, 4 and 5 are included under `src/Runner.Engine/Migrations/`. Upgrades are explicit and repeatable with workers stopped and a backup available. Selecting a different storage provider points Runner at a different database; it does not transfer existing jobs or packages across providers. Plan and validate that data cutover separately. The supplied Compose preset still uses PostgreSQL; point a published host/container at your SQL Server using the settings above.
 
 ## Cloud and on-premises deployment
 
@@ -496,13 +578,13 @@ docker compose up --build -d
 
 Compose runs one initialization job after PostgreSQL passes its health check, then starts Runner. PostgreSQL's port is not published to the host; Runner binds only to 127.0.0.1. In production, place a TLS reverse proxy in front of Runner and prevent direct access to the application container. Set `Security__TrustedProxy` to the actual proxy IP. Production cookies require HTTPS; browser login will not work over plain HTTP. You can use loopback HTTP with an API key for health and API smoke checks.
 
-For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3/4 upgrade from the published directory with the correct provider and connection string:
+For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3/4/5 upgrade from the published directory with the correct provider and connection string:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-packages
+dotnet Runner.Host.dll --upgrade-concurrency
 ```
 
-The upgrade adds the function registry, nullable job result column, execution journal, alert outbox, and plugin package registry; it preserves existing jobs and schedules, records schema versions 2, 3 and 4, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
+The upgrade adds the function registry, nullable job result column, execution journal, alert outbox, and plugin package registry; it preserves existing jobs and schedules, records schema versions 2, 3, 4 and 5, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
 
 Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating the API key does not immediately revoke existing eight-hour cookies: immediate session revocation requires cookie key ring rotation or an additional authentication revocation mechanism. Built-in authentication has a single operator role; multi-user RBAC and audit requirements need an OIDC gateway and centralized audit integration. Restrict access before exposing the service to the public internet.
 
@@ -538,3 +620,5 @@ To regenerate the committed screenshots, start a local instance with scripting e
 Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests all three Runner storage providers and both business database command providers. SQL Server Developer is used only for development/testing, with test-only plaintext loopback connections; configure encryption and licensing appropriately for production. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.
 
 Package validation also exercises immutable uploads, entry contracts, archive integrity, activation revisions, pause/resume, version-pinned jobs/schedules, rollback/history, and repeatable version 4 upgrades. Run `scripts/package_smoke.py` with `SMOKE_POSTGRES` for PostgreSQL job storage or `SMOKE_MSSQL` for SQL Server job storage. Optional `scripts/package_browser.cjs` uses Playwright/Chromium to select files and a folder outside the application tree, install and run two versions live, disable/roll back, and capture package manager screenshots. Use a disposable development instance and `RUNNER_SCREENSHOT_URL` / `RUNNER_KEY_FILE` as with the other capture tools.
+
+For multi-host validation, pack/verify the SDK first, then run `scripts/cluster_smoke.py` with a dedicated shared test database selected by `SMOKE_POSTGRES` or `SMOKE_MSSQL`. It launches two independent hosts, verifies sequential non-overlap and parallel overlap on both nodes, rejects unsafe live mode changes, kills one owner, and verifies lease takeover. This is a process-level integration test, not a multi-machine partition/chaos benchmark.

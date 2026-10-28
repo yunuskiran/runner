@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Reflection;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -18,63 +19,80 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
         var digest = PackageArchive.Hash(archive);
         var temporary = Path.Combine(Path.GetTempPath(), "runner-package-inspect-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temporary);
+        var defaultMode = PluginExecutionMode.Parallel;
         try
         {
             PackageArchive.Extract(archive, temporary);
             var inspected = PackageArchive.Inspect(temporary, entryAssembly, entryType);
-            try { entryType = inspected.EntryType.FullName!; }
+            try
+            {
+                entryType = inspected.EntryType.FullName!;
+                defaultMode = inspected.EntryType.GetCustomAttribute<RunnerPluginAttribute>()?.ExecutionMode ?? PluginExecutionMode.Parallel;
+                if (!Enum.IsDefined(defaultMode)) throw new PackageException("Unknown plugin execution mode");
+            }
             finally { inspected.Context.Unload(); }
         }
         finally { TryDelete(temporary); }
-        await using var db = await factory.CreateDbContextAsync(ct);
-        var existing = await db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
-            .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc)).SingleOrDefaultAsync(ct);
-        if (existing is not null)
+        // Commit the immutable version and first channel policy together. A losing concurrent
+        // first install retries only after observing the channel/version committed by its peer.
+        for (int attempt = 0; attempt < 3; attempt++)
         {
-            if (existing.Digest == digest && existing.EntryAssembly == entryAssembly && existing.EntryType == entryType) return existing;
-            throw new PackageConflictException("This package version is immutable. Upload changed content under a new version.");
-        }
-        var package = new PluginPackage { PackageId = id, Version = version, EntryAssembly = entryAssembly, EntryType = entryType!, Digest = digest, Archive = archive };
-        // Channel creation is separate and idempotent so concurrent version installs do not overwrite activation state.
-        if (!await db.PluginChannels.AnyAsync(x => x.PackageId == id, ct))
-        {
-            db.PluginChannels.Add(new PluginChannel { PackageId = id });
-            try { await db.SaveChangesAsync(ct); }
+            await using var db = await factory.CreateDbContextAsync(ct);
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            var existing = await VersionInfo(db, id, version, ct);
+            if (existing is not null) return MatchExisting(existing, digest, entryAssembly, entryType!);
+            var newChannel = !await db.PluginChannels.AnyAsync(x => x.PackageId == id, ct);
+            if (newChannel) db.PluginChannels.Add(new PluginChannel { PackageId = id, ExecutionMode = defaultMode });
+            var package = new PluginPackage { PackageId = id, Version = version, EntryAssembly = entryAssembly,
+                EntryType = entryType!, Digest = digest, Archive = archive, DefaultExecutionMode = defaultMode };
+            db.PluginPackages.Add(package);
+            try
+            {
+                await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
+                return new(id, version, entryAssembly, entryType!, digest, package.InstalledUtc, defaultMode);
+            }
             catch (DbUpdateException)
             {
-                db.ChangeTracker.Clear();
-                if (!await db.PluginChannels.AnyAsync(x => x.PackageId == id, ct)) throw;
+                await transaction.RollbackAsync(ct);
+                await using var verification = await factory.CreateDbContextAsync(ct);
+                var winner = await VersionInfo(verification, id, version, ct);
+                if (winner is not null) return MatchExisting(winner, digest, entryAssembly, entryType!);
+                if (newChannel && attempt < 2 && await verification.PluginChannels.AnyAsync(x => x.PackageId == id, ct)) continue;
+                throw;
             }
         }
-        db.PluginPackages.Add(package);
-        try { await db.SaveChangesAsync(ct); }
-        catch (DbUpdateException)
-        {
-            db.ChangeTracker.Clear();
-            var winner = await db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
-                .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc)).SingleOrDefaultAsync(ct);
-            if (winner is null) throw;
-            if (winner.Digest == digest && winner.EntryAssembly == entryAssembly && winner.EntryType == entryType) return winner;
-            throw new PackageConflictException("This package version already exists with different content");
-        }
-        return new(id, version, entryAssembly, entryType!, digest, package.InstalledUtc);
+        throw new PackageConflictException("Concurrent package installation did not settle; refresh and retry");
     }
-    public async Task<bool> SetChannelAsync(string id, string? version, bool enabled, int revision, CancellationToken ct, string actor = "operator")
+    private static Task<PackageInfo?> VersionInfo(RunnerDb db, string id, string version, CancellationToken ct) =>
+        db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
+            .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc, x.DefaultExecutionMode)).SingleOrDefaultAsync(ct);
+    private static PackageInfo MatchExisting(PackageInfo existing, string digest, string entryAssembly, string entryType)
+    {
+        if (existing.Digest == digest && existing.EntryAssembly == entryAssembly && existing.EntryType == entryType) return existing;
+        throw new PackageConflictException("This package version is immutable. Upload changed content under a new version.");
+    }
+
+    public async Task<bool> SetChannelAsync(string id, string? version, bool enabled, int revision, CancellationToken ct, string actor = "operator", PluginExecutionMode? executionMode = null)
     {
         if (!Enabled) throw new PackageException("Package management is disabled");
         await using var db = await factory.CreateDbContextAsync(ct);
         if (enabled && (version is null || !await db.PluginPackages.AnyAsync(x => x.PackageId == id && x.Version == version, ct)))
             throw new PackageException("Select an installed package version to activate");
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        if (executionMode is { } requestedMode && !Enum.IsDefined(requestedMode)) throw new PackageException("Invalid execution mode");
+        if (await PackageConcurrency.LockAsync(db, id, ct, revision) == 0) return false;
         var previous = await db.PluginChannels.AsNoTracking().SingleOrDefaultAsync(x => x.PackageId == id, ct);
         if (previous is null || previous.Revision != revision) return false;
         var targetVersion = enabled ? version : previous.ActiveVersion;
+        var targetMode = executionMode ?? previous.ExecutionMode;
+        if (targetMode != previous.ExecutionMode && await db.Jobs.AnyAsync(x => x.PackageId == id && x.State == JobState.Running && x.LeaseUntilUtc > DateTime.UtcNow, ct))
+            throw new PackageConflictException("Drain running jobs before changing the package execution mode");
         var changed = await db.PluginChannels.Where(x => x.PackageId == id && x.Revision == revision)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.ActiveVersion, targetVersion).SetProperty(x => x.Enabled, enabled)
-                .SetProperty(x => x.Revision, x => x.Revision + 1).SetProperty(x => x.ChangedUtc, DateTime.UtcNow), ct) == 1;
+                .SetProperty(x => x.ExecutionMode, targetMode).SetProperty(x => x.Revision, x => x.Revision + 1).SetProperty(x => x.ChangedUtc, DateTime.UtcNow), ct) == 1;
         if (!changed) return false;
         db.PackageChanges.Add(new PackageChange { PackageId = id, PreviousVersion = previous.ActiveVersion, Version = targetVersion,
-            Enabled = enabled, Revision = revision + 1, Actor = actor.Length > 120 ? actor[..120] : actor });
+            Enabled = enabled, ExecutionMode = targetMode, PreviousExecutionMode = previous.ExecutionMode, Revision = revision + 1, Actor = actor.Length > 120 ? actor[..120] : actor });
         await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
         return true;
     }
@@ -98,7 +116,7 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
     {
         await using var db = await factory.CreateDbContextAsync(ct);
         var info = await db.PluginPackages.AsNoTracking().Where(x => x.PackageId == id && x.Version == version)
-            .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc)).SingleOrDefaultAsync(ct)
+            .Select(x => new PackageInfo(x.PackageId, x.Version, x.EntryAssembly, x.EntryType, x.Digest, x.InstalledUtc, x.DefaultExecutionMode)).SingleOrDefaultAsync(ct)
             ?? throw new PackageException("Pinned plugin package is unavailable");
         var root = Path.GetFullPath(options.Value.CacheDirectory);
         var destination = Path.Combine(root, info.Digest);

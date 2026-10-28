@@ -4,8 +4,8 @@ Validated in the onboarding Linux environment using .NET SDK 10.0.403:
 
 - Locked dependency restore: passed.
 - Release solution build: passed, zero warnings/errors.
-- Relational store tests: 59 passed with SQLite job storage, 59 passed with PostgreSQL 17 job storage, 59 passed with SQL Server 2022 job storage; none skipped.
-- Business database provider integration: real PostgreSQL 17 and SQL Server 2022 Developer passed parameterized query/injection-literal, scalar/null, bounded results, execute, and timeout checks. Both live provider bindings were set; none of the 59 tests were skipped in the complete runs. Without bindings, the two external provider tests explicitly skip.
+- Relational store tests: 68 passed with SQLite job storage, 68 passed with PostgreSQL 17 job storage, 68 passed with SQL Server 2022 job storage; none skipped.
+- Business database provider integration: real PostgreSQL 17 and SQL Server 2022 Developer passed parameterized query/injection-literal, scalar/null, bounded results, execute, and timeout checks. Both live provider bindings were set; none of the 68 tests were skipped in the complete runs. Without bindings, the two external provider tests explicitly skip.
 - Process checks: literal arguments, bounded concurrent stdout/stderr draining, environment isolation, nonzero exit handling, timeout and cancellation passed on Linux. Native Windows executable execution has not been validated here.
 - Central journal/outbox tests: atomic failure/alert creation, expired final-attempt alert deduplication, delivery claim concurrency/fencing, bounded retries/parking, and repeatable version 3 upgrades passed on both job storage providers.
 - Operations smoke: ready database/process jobs, safe resource metadata, centralized business/process logs, attempt reports and CSV, incident acknowledgement, Roslyn Db/Log helpers, and a real local HTTP webhook receiver passed. The receiver rejected the first signed request with 500; the second request delivered the same alert ID with valid HMAC.
@@ -38,3 +38,10 @@ The cloud draft stores install_script, start_skill and the MCR domain addition. 
 - SQL Server package and full application smoke checks exercised live upload/rollback, scripts, database/process jobs, reporting/CSV, centralized logs and signed webhook retry. The published application was tested with SQL Server storage.
 - A provider cancellation edge case was addressed by checking cancellation and elapsed budget before returning database command results. Timeout integration checks now assert the database_timeout classification.
 - CI includes MSSQL primary storage test and smoke steps. Runner storage and business-command connection providers are configured independently. No cross-provider data migration is performed when selecting a different store.
+
+## Cluster policy and NuGet SDK — 2026-10-28
+
+- All 68 tests passed on each of SQLite, PostgreSQL 17, and SQL Server 2022, with no skips in complete runs. New checks cover sequential claim exclusivity across hosts/versions, independent packages, parallel overlap, renewed gate leases, stale completion/renewal/log fencing, retry/final-crash release, active-mode drain guards, concurrent initial installs, and repeatable version 5 upgrades.
+- Two independent host processes passed integration checks on PostgreSQL and MSSQL (and a local SQLite file): plugin attribute default, sequential non-overlap, parallel execution on both node identities, rejected mode changes while active, and takeover after killing the owner process. Separate local package materialization directories were used for the nodes. This does not simulate a network partition between physical machines.
+- The SDK .nupkg and .snupkg were packed locally. Metadata, XML docs, build targets and symbol content were inspected. A consumer was restored/published from a fresh local NuGet cache, and its output excluded Runner.Contracts.dll. That SDK-built plugin was installed/executed by the two-host tests. No package was pushed to an external NuGet feed; namespace ownership and release licensing remain a publisher decision.
+- Host schema version 5 is required on every node before enabling sequential policies. The gate protects valid DB ownership; it cannot stop arbitrary old code continuing external side effects after losing a lease. Cancellation and idempotency remain required.

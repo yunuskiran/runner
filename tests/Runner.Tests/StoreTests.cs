@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.EntityFrameworkCore;
 using Runner.Engine;
+using Runner.Contracts;
 using Runner.Engine.Packaging;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -254,7 +255,7 @@ public sealed class StoreTests : IAsyncLifetime
     {
         var job = await Add(); await using var db = factory.CreateDbContext();
         await db.Database.ExecuteSqlRawAsync("DROP TABLE \"PluginPackages\"; DROP TABLE \"PluginChannels\"; DROP TABLE \"PackageChanges\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageVersion\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageVersion\";");
-        await SchemaUpgrade.ApplyPackagesAsync(db); await SchemaUpgrade.ApplyPackagesAsync(db);
+        await SchemaUpgrade.ApplyConcurrencyAsync(db); await SchemaUpgrade.ApplyConcurrencyAsync(db);
         Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.PluginPackages.Select(x => x.PackageId).ToListAsync());
         var packages = PackageService();
         foreach (var version in new[] { "1.0.0-rc.1", "1.0.0-RC.1" })
@@ -274,6 +275,95 @@ public sealed class StoreTests : IAsyncLifetime
         await db.SaveChangesAsync();
         Assert.Equal(4, await db.Jobs.CountAsync());
         Assert.Equal(1, await db.Jobs.CountAsync(x => x.IdempotencyKey == "Order-123"));
+    }
+    private async Task SeedPluginJobs(PluginExecutionMode mode, int count, string packageId = "concurrency.test", string version = "1.0.0")
+    {
+        await using var db = factory.CreateDbContext();
+        db.PluginChannels.Add(new PluginChannel { PackageId = packageId, Enabled = true, ActiveVersion = version, ExecutionMode = mode });
+        for (int n = 0; n < count; n++) db.Jobs.Add(new Job { Type = PackageJobHandler.JobType, PackageId = packageId, PackageVersion = n % 2 == 0 ? version : "2.0.0", AvailableUtc = now.AddSeconds(-1) });
+        await db.SaveChangesAsync();
+    }
+    [Fact] public async Task Sequential_claim_is_exclusive_across_workers_and_versions()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Sequential, 8);
+        var claims = await Task.WhenAll(Enumerable.Range(0, 12).Select(n => store.ClaimAsync("node-" + n, now, TimeSpan.FromSeconds(30), default)));
+        var owner = Assert.Single(claims, x => x is not null)!;
+        Assert.True(await store.CompleteAsync(owner, now.AddSeconds(1), null, default));
+        var next = (await Claim(now.AddSeconds(2)))!; Assert.NotEqual(owner.Id, next.Id);
+        await using var db = factory.CreateDbContext(); Assert.Equal(2, await db.Attempts.CountAsync());
+    }
+    [Fact] public async Task Parallel_claims_allow_different_jobs_to_overlap()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Parallel, 8);
+        var claims = await Task.WhenAll(Enumerable.Range(0, 8).Select(n => store.ClaimAsync("node-" + n, now, TimeSpan.FromSeconds(30), default)));
+        Assert.Equal(8, claims.Count(x => x is not null)); Assert.Equal(8, claims.Select(x => x!.Id).Distinct().Count());
+    }
+    [Fact] public async Task Sequential_renewal_failure_and_takeover_preserve_fencing()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Sequential, 2);
+        var first = (await Claim())!;
+        Assert.True(await store.RenewAsync(first.Id, first.LeaseToken!.Value, now.AddSeconds(20), TimeSpan.FromSeconds(30), default));
+        Assert.Null(await Claim(now.AddSeconds(31)));
+        var next = (await Claim(now.AddSeconds(51)))!;
+        Assert.False(await store.RenewAsync(first.Id, first.LeaseToken.Value, now.AddSeconds(52), TimeSpan.FromSeconds(30), default));
+        Assert.False(await store.CompleteAsync(first, now.AddSeconds(52), null, default));
+        Assert.True(await store.CompleteAsync(next, now.AddSeconds(52), null, default));
+    }
+    [Fact] public async Task Sequential_packages_are_independent_and_retry_releases_the_slot()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Sequential, 2, "package.one");
+        await SeedPluginJobs(PluginExecutionMode.Sequential, 1, "package.two");
+        var first = (await Claim())!; var second = (await Claim())!; Assert.NotEqual(first.PackageId, second.PackageId);
+        Assert.Null(await Claim());
+        await store.CompleteAsync(first, now, "retry", default);
+        var third = (await Claim())!; Assert.Equal(first.PackageId, third.PackageId); Assert.NotEqual(first.Id, third.Id);
+    }
+    [Fact] public async Task Mode_change_requires_valid_leases_to_drain()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Parallel, 2);
+        await using (var db = factory.CreateDbContext()) { db.PluginPackages.Add(new PluginPackage { PackageId = "concurrency.test", Version = "1.0.0" }); await db.SaveChangesAsync(); }
+        var job = (await Claim())!;
+        await Assert.ThrowsAsync<PackageConflictException>(() => PackageService().SetChannelAsync("concurrency.test", "1.0.0", true, 0, default, executionMode: PluginExecutionMode.Sequential));
+        await store.CompleteAsync(job, now.AddSeconds(1), null, default);
+        Assert.True(await PackageService().SetChannelAsync("concurrency.test", "1.0.0", true, 0, default, executionMode: PluginExecutionMode.Sequential));
+    }
+    [Fact] public async Task Sequential_final_crash_releases_slot_for_following_job()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Sequential, 2);
+        var job = (await Claim())!;
+        await using (var db = factory.CreateDbContext()) await db.Jobs.Where(x => x.Id == job.Id).ExecuteUpdateAsync(s => s.SetProperty(x => x.MaxAttempts, 1));
+        var next = (await Claim(now.AddSeconds(31)))!; Assert.NotEqual(job.Id, next.Id);
+        await using var verify = factory.CreateDbContext(); Assert.Equal(next.LeaseToken, (await verify.PluginChannels.SingleAsync()).ExecutionToken);
+    }
+    [Fact] public async Task Concurrency_upgrade_preserves_versions_and_defaults_to_parallel()
+    {
+        var packages = PackageService(); await packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
+        await using var db = factory.CreateDbContext();
+        // A freshly created EF schema has no column defaults; the upgrade adds defaults for existing rows.
+        if (db.Database.IsSqlServer())
+        {
+            await db.Database.ExecuteSqlRawAsync("ALTER TABLE [dbo].[PluginPackages] DROP COLUMN [DefaultExecutionMode]; ALTER TABLE [dbo].[PluginChannels] DROP COLUMN [ExecutionMode], [ExecutionToken], [ExecutionLeaseUtc]; ALTER TABLE [dbo].[PackageChanges] DROP COLUMN [ExecutionMode], [PreviousExecutionMode];");
+        }
+        else await db.Database.ExecuteSqlRawAsync("ALTER TABLE \"PluginPackages\" DROP COLUMN \"DefaultExecutionMode\"; ALTER TABLE \"PluginChannels\" DROP COLUMN \"ExecutionMode\"; ALTER TABLE \"PluginChannels\" DROP COLUMN \"ExecutionToken\"; ALTER TABLE \"PluginChannels\" DROP COLUMN \"ExecutionLeaseUtc\"; ALTER TABLE \"PackageChanges\" DROP COLUMN \"ExecutionMode\"; ALTER TABLE \"PackageChanges\" DROP COLUMN \"PreviousExecutionMode\";");
+        await SchemaUpgrade.ApplyConcurrencyAsync(db); await SchemaUpgrade.ApplyConcurrencyAsync(db);
+        Assert.Equal(PluginExecutionMode.Parallel, (await db.PluginChannels.SingleAsync()).ExecutionMode);
+        Assert.Equal(1, await db.PluginPackages.CountAsync());
+    }
+    [Fact] public async Task Concurrent_first_installs_commit_one_channel_and_all_versions()
+    {
+        var packages = PackageService(); var files = FixtureFiles();
+        await Task.WhenAll(Enumerable.Range(1, 4).Select(n => packages.InstallAsync("concurrent.install", $"1.0.{n}", "Runner.SamplePlugin.dll", null, files, default)));
+        await using var db = factory.CreateDbContext();
+        Assert.Equal(4, await db.PluginPackages.CountAsync()); Assert.Equal(1, await db.PluginChannels.CountAsync());
+    }
+    [Fact] public async Task Lost_sequential_slot_rejects_business_logs_from_the_previous_job()
+    {
+        await SeedPluginJobs(PluginExecutionMode.Sequential, 2);
+        var first = (await Claim())!;
+        await using (var db = factory.CreateDbContext())
+            await db.Jobs.Where(x => x.Id == first.Id).ExecuteUpdateAsync(s => s.SetProperty(x => x.AvailableUtc, now.AddHours(1)));
+        var next = (await Claim(now.AddSeconds(31)))!; Assert.NotEqual(first.Id, next.Id);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.WriteLogAsync(first, "Information", "stale owner", default));
     }
     private sealed class TestFactory(DbContextOptions<RunnerDb> options) : IDbContextFactory<RunnerDb>
     { public RunnerDb CreateDbContext() => new(options); }

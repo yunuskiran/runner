@@ -41,6 +41,14 @@ jobs:
       - run: dotnet test tests/Runner.Tests -c Release --no-build --logger 'trx;LogFileName=mssql.trx'
         env:
           TEST_MSSQL: Server=localhost,1433;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
+      - run: bash scripts/pack-plugin-sdk.sh
+      - run: python3 scripts/verify-plugin-sdk.py
+      - run: python3 scripts/cluster_smoke.py
+        env:
+          SMOKE_POSTGRES: Host=localhost;Database=runner_cluster_pg;Username=postgres;Password=ci-test-only
+      - run: python3 scripts/cluster_smoke.py
+        env:
+          SMOKE_MSSQL: Server=localhost,1433;Database=runner_cluster_sql;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
       - run: python3 scripts/smoke.py
       - run: python3 scripts/smoke.py
         env:
@@ -65,3 +73,10 @@ jobs:
           SMOKE_MSSQL: Server=localhost,1433;Database=runner_mssql_packages_smoke;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
       - run: dotnet publish src/Runner.Host -c Release --no-restore -o artifacts/publish
       - run: docker build -t runner:ci .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runner-plugin-sdk
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+            artifacts/nuget/checksums.json
