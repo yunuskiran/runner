@@ -119,10 +119,41 @@ public static class SchemaUpgrade
             using var reader = new StreamReader(stream);
             await db.Database.ExecuteSqlRawAsync(await reader.ReadToEndAsync(ct), ct);
         }
-        await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Take(1).ToListAsync(ct);
+        await db.PluginChannels.AsNoTracking().OrderBy(x => x.PackageId).Select(x => new { x.PackageId, x.ExecutionMode, x.ExecutionToken, x.ExecutionLeaseUtc }).Take(1).ToListAsync(ct);
         await db.PluginPackages.AsNoTracking().OrderBy(x => x.PackageId).Select(x => x.DefaultExecutionMode).Take(1).ToListAsync(ct);
-        await db.PackageChanges.AsNoTracking().OrderBy(x => x.Id).Take(1).ToListAsync(ct);
+        await db.PackageChanges.AsNoTracking().OrderBy(x => x.Id).Select(x => new { x.Id, x.ExecutionMode, x.PreviousExecutionMode }).Take(1).ToListAsync(ct);
         await RecordVersionAsync(db, 5, ct); await transaction.CommitAsync(ct);
+    }
+
+    public static async Task ApplyPlatformAsync(RunnerDb db, CancellationToken ct = default)
+    {
+        await ApplyConcurrencyAsync(db, ct);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.Transaction = tx.GetDbTransaction();
+        command.CommandText = db.Database.IsSqlServer()
+            ? "SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID(N'dbo') AND name = N'WorkerNodes'"
+            : db.Database.IsNpgsql() ? "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'WorkerNodes'"
+            : "SELECT name FROM sqlite_master WHERE type='table' AND name='WorkerNodes'";
+        if (await command.ExecuteScalarAsync(ct) is null)
+        {
+            var provider = db.Database.IsSqlServer() ? "mssql" : db.Database.IsNpgsql() ? "postgres" : "sqlite";
+            await using var stream = typeof(SchemaUpgrade).Assembly.GetManifestResourceStream($"Runner.Engine.Migrations.006-platform.{provider}.sql")
+                ?? throw new InvalidOperationException("Upgrade resource missing");
+            using var reader = new StreamReader(stream);
+            var sql = await reader.ReadToEndAsync(ct);
+            foreach (var batch in sql.Split("\nGO", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            { command.CommandText = batch; await command.ExecuteNonQueryAsync(ct); }
+        }
+        await db.WorkerNodes.AsNoTracking().Take(1).ToListAsync(ct);
+        await db.Jobs.AsNoTracking().OrderBy(x => x.Id).Take(1).ToListAsync(ct);
+        await db.PluginPackages.AsNoTracking().Select(x => x.ManifestJson).Take(1).ToListAsync(ct);
+        await db.PluginChannels.AsNoTracking().Select(x => x.MaxConcurrency).Take(1).ToListAsync(ct);
+        await db.JobDependencies.AsNoTracking().Take(1).ToListAsync(ct);
+        await db.Workflows.AsNoTracking().Take(1).ToListAsync(ct);
+        await db.AuditRecords.AsNoTracking().Take(1).ToListAsync(ct);
+        await db.Schedules.AsNoTracking().Take(1).ToListAsync(ct);
+        await RecordVersionAsync(db, 6, ct); await tx.CommitAsync(ct);
     }
 
     private static Task<int> RecordVersionAsync(RunnerDb db, int version, CancellationToken ct) => db.Database.IsSqlServer()

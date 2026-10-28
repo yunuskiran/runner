@@ -6,7 +6,7 @@ using Microsoft.Extensions.Options;
 using Runner.Contracts;
 namespace Runner.Engine.Packaging;
 
-public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions<PackageOptions> options)
+public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions<PackageOptions> options, ClusterClock? clock = null)
 {
     public bool Enabled => options.Value.Enabled;
     public async Task<PackageInfo> InstallAsync(string id, string version, string entryAssembly, string? entryType,
@@ -15,6 +15,10 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
         if (!Enabled) throw new PackageException("Package management is disabled");
         if (!PackageArchive.ValidIdentity(id, version)) throw new PackageException("Use a lowercase package ID and a semantic version such as 1.2.3 or 1.2.3-rc.1");
         entryAssembly = PackageArchive.SafePath(entryAssembly);
+        var manifestFile = files.SingleOrDefault(x => x.Path.Replace('\\', '/') == "runner.manifest.json");
+        var manifestJson = manifestFile is null ? "{}" : System.Text.Encoding.UTF8.GetString(manifestFile.Content);
+        var manifest = PluginManifest.Parse(manifestJson);
+        manifestJson = JsonSerializer.Serialize(manifest, JsonSerializerOptions.Web);
         var archive = PackageArchive.Build(files, entryAssembly);
         var digest = PackageArchive.Hash(archive);
         var temporary = Path.Combine(Path.GetTempPath(), "runner-package-inspect-" + Guid.NewGuid().ToString("N"));
@@ -44,11 +48,13 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
             var newChannel = !await db.PluginChannels.AnyAsync(x => x.PackageId == id, ct);
             if (newChannel) db.PluginChannels.Add(new PluginChannel { PackageId = id, ExecutionMode = defaultMode });
             var package = new PluginPackage { PackageId = id, Version = version, EntryAssembly = entryAssembly,
-                EntryType = entryType!, Digest = digest, Archive = archive, DefaultExecutionMode = defaultMode };
+                EntryType = entryType!, Digest = digest, Archive = archive, DefaultExecutionMode = defaultMode, ManifestJson = manifestJson };
             db.PluginPackages.Add(package);
             try
             {
-                await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
+                await db.SaveChangesAsync(ct);
+                await db.ClusterLeases.Where(x => x.Name == "packages").ExecuteUpdateAsync(s => s.SetProperty(x => x.Owner, Guid.NewGuid().ToString("N")), ct);
+                await transaction.CommitAsync(ct);
                 return new(id, version, entryAssembly, entryType!, digest, package.InstalledUtc, defaultMode);
             }
             catch (DbUpdateException)
@@ -72,7 +78,7 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
         throw new PackageConflictException("This package version is immutable. Upload changed content under a new version.");
     }
 
-    public async Task<bool> SetChannelAsync(string id, string? version, bool enabled, int revision, CancellationToken ct, string actor = "operator", PluginExecutionMode? executionMode = null)
+    public async Task<bool> SetChannelAsync(string id, string? version, bool enabled, int revision, CancellationToken ct, string actor = "operator", PluginExecutionMode? executionMode = null, int? maxConcurrency = null, bool setLimit = false)
     {
         if (!Enabled) throw new PackageException("Package management is disabled");
         await using var db = await factory.CreateDbContextAsync(ct);
@@ -85,14 +91,16 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
         if (previous is null || previous.Revision != revision) return false;
         var targetVersion = enabled ? version : previous.ActiveVersion;
         var targetMode = executionMode ?? previous.ExecutionMode;
-        if (targetMode != previous.ExecutionMode && await db.Jobs.AnyAsync(x => x.PackageId == id && x.State == JobState.Running && x.LeaseUntilUtc > DateTime.UtcNow, ct))
+        var targetLimit = setLimit ? maxConcurrency : previous.MaxConcurrency;
+        if (targetLimit is < 1 or > 1024) throw new PackageException("Cluster concurrency must be 1–1024 or unlimited");
+        if ((targetMode != previous.ExecutionMode || targetLimit != previous.MaxConcurrency) && await db.Jobs.AnyAsync(x => x.PackageId == id && x.State == JobState.Running && x.LeaseUntilUtc > (clock == null ? DateTime.UtcNow : clock.UtcNow), ct))
             throw new PackageConflictException("Drain running jobs before changing the package execution mode");
         var changed = await db.PluginChannels.Where(x => x.PackageId == id && x.Revision == revision)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.ActiveVersion, targetVersion).SetProperty(x => x.Enabled, enabled)
-                .SetProperty(x => x.ExecutionMode, targetMode).SetProperty(x => x.Revision, x => x.Revision + 1).SetProperty(x => x.ChangedUtc, DateTime.UtcNow), ct) == 1;
+                .SetProperty(x => x.MaxConcurrency, targetLimit).SetProperty(x => x.ExecutionMode, targetMode).SetProperty(x => x.Revision, x => x.Revision + 1).SetProperty(x => x.ChangedUtc, DateTime.UtcNow), ct) == 1;
         if (!changed) return false;
         db.PackageChanges.Add(new PackageChange { PackageId = id, PreviousVersion = previous.ActiveVersion, Version = targetVersion,
-            Enabled = enabled, ExecutionMode = targetMode, PreviousExecutionMode = previous.ExecutionMode, Revision = revision + 1, Actor = actor.Length > 120 ? actor[..120] : actor });
+            Enabled = enabled, MaxConcurrency = targetLimit, PreviousMaxConcurrency = previous.MaxConcurrency, ExecutionMode = targetMode, PreviousExecutionMode = previous.ExecutionMode, Revision = revision + 1, Actor = actor.Length > 120 ? actor[..120] : actor });
         await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
         return true;
     }
@@ -120,9 +128,35 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
             ?? throw new PackageException("Pinned plugin package is unavailable");
         var root = Path.GetFullPath(options.Value.CacheDirectory);
         var destination = Path.Combine(root, info.Digest);
-        // Verify the archive and materialize to a unique directory per execution. No shared mutable DLL files.
-        var archive = await db.PluginPackages.Where(x => x.PackageId == id && x.Version == version).Select(x => x.Archive).SingleAsync(ct);
-        if (PackageArchive.Hash(archive) != info.Digest) throw new PackageException("Package integrity check failed");
+        // Immutable, digest-addressed local ZIP cache avoids downloading the same DB blob for every job.
+        if (info.Digest.Length != 64 || !info.Digest.All(char.IsAsciiHexDigit)) throw new PackageException("Invalid package digest");
+        RejectLinks(root); Directory.CreateDirectory(root);
+        var archiveDirectory = Path.Combine(root, "archives"); RejectLinks(archiveDirectory); Directory.CreateDirectory(archiveDirectory);
+        var cached = Path.Combine(archiveDirectory, info.Digest + ".zip");
+        byte[]? archive = null;
+        if (File.Exists(cached))
+        {
+            var file = new FileInfo(cached);
+            if (file.LinkTarget is not null) throw new PackageException("Archive cache must not contain symlinks");
+            if (file.Length <= PackageArchive.MaxBytes)
+            {
+                var bytes = await File.ReadAllBytesAsync(cached, ct);
+                if (PackageArchive.Hash(bytes) == info.Digest) archive = bytes;
+            }
+            if (archive is null) File.Delete(cached);
+        }
+        if (archive is null)
+        {
+            archive = await db.PluginPackages.Where(x => x.PackageId == id && x.Version == version).Select(x => x.Archive).SingleAsync(ct);
+            if (archive.Length > PackageArchive.MaxBytes || PackageArchive.Hash(archive) != info.Digest) throw new PackageException("Package integrity check failed");
+            var staging = cached + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                await File.WriteAllBytesAsync(staging, archive, ct);
+                try { File.Move(staging, cached); } catch (IOException) when (File.Exists(cached)) { }
+            }
+            finally { if (File.Exists(staging)) File.Delete(staging); }
+        }
         RejectLinks(root);
         Directory.CreateDirectory(root);
         destination += "-" + Guid.NewGuid().ToString("N");
@@ -143,7 +177,7 @@ public sealed class PackageManager(IDbContextFactory<RunnerDb> factory, IOptions
     }
 }
 
-public sealed class PackageJobHandler(PackageManager packages, IServiceProvider services) : IJobHandler
+public sealed class PackageJobHandler(PackageManager packages, IServiceProvider services, IsolatedExecutor? executor = null) : IJobHandler
 {
     public const string JobType = "runner.plugin";
     public string Type => JobType;
@@ -157,6 +191,11 @@ public sealed class PackageJobHandler(PackageManager packages, IServiceProvider 
         PluginLoadContext? loadContext = null;
         try
         {
+            if (executor?.Enabled == true)
+            {
+                await executor.ExecuteAsync(context with { Payload = request.Payload.GetRawText() }, materialized.Directory, materialized.Info, null, ct);
+                return;
+            }
             var entry = PackageArchive.Inspect(materialized.Directory, materialized.Info.EntryAssembly, materialized.Info.EntryType);
             loadContext = entry.Context;
             var plugin = (IRunnerPlugin)ActivatorUtilities.CreateInstance(services, entry.EntryType);

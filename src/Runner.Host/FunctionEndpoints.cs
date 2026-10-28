@@ -54,10 +54,11 @@ public static partial class FunctionEndpoints
                 function.Id, function.Name, function.Version, function.SourceHash);
             return Results.Created($"/api/functions/{function.Id}", function);
         }).RequireRateLimiting("script-registration");
-        functions.MapPatch("/{id:guid}", async (Guid id, FunctionStatus input, IDbContextFactory<RunnerDb> factory,
+        functions.MapPatch("/{id:guid}", async (Guid id, FunctionStatus input, HttpContext context, IDbContextFactory<RunnerDb> factory,
             ILoggerFactory logs, CancellationToken ct) =>
         {
             await using var db = await factory.CreateDbContextAsync(ct);
+            context.Items["RunnerAudit"] = new { input.Enabled };
             var changed = await db.Functions.Where(x => x.Id == id).ExecuteUpdateAsync(s => s.SetProperty(x => x.Enabled, input.Enabled), ct);
             if (changed == 0) return Results.NotFound();
             logs.CreateLogger("Runner.Functions").LogInformation("Function {FunctionId} enabled={Enabled}", id, input.Enabled);

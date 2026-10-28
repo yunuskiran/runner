@@ -1,0 +1,7 @@
+{
+  "name": "runner-browser-validation",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Optional browser validation tooling; not an application runtime dependency.",
+  "devDependencies": { "playwright": "1.62.1" }
+}

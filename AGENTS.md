@@ -9,7 +9,7 @@ This cloud task already has an isolated checkout. Use this checkout; do not crea
 - Preserve at-least-once semantics, atomic schedule dispatch, lease-token and expiry checks. Never rely on in-memory locks for cross-instance correctness.
 - Plugins are trusted code, not sandboxed code. No exactly-once promises for external side effects.
 - Use PostgreSQL or SQL Server for multi-instance deployments; local SQLite is a development/single-node option.
-- Initial bootstrap uses EnsureCreated. The --upgrade-concurrency command applies versions 2–5 (functions, operations, packages and cluster concurrency) and is repeatable. Future model changes need new versioned upgrades, preservation/repeatability tests on both providers, and deployment planning.
+- Initial bootstrap uses EnsureCreated. The --upgrade-platform command applies versions 2–6 (functions, operations, packages, cluster concurrency and operations platform) and is repeatable. Future model changes need new versioned upgrades, preservation/repeatability tests on both providers, and deployment planning.
 - Roslyn scripting is disabled by default and runs trusted code with host privileges. Preserve immutable function versions, queued function IDs, result fencing and cooperative cancellation; never describe in-process scripting as sandboxed.
 
 - Built-in database/process operations use named Operations resources. Keep connection strings, executable paths and webhook secrets out of payloads and resource API responses. Never add shell-based execution.
@@ -26,3 +26,9 @@ This cloud task already has an isolated checkout. Use this checkout; do not crea
 - Changing execution mode requires all valid leases for that package to drain. The plugin attribute sets only a newly installed package ID's initial policy; channel policy is operator-managed afterward.
 - SDK package artifacts stay in artifacts/nuget. Do not publish to an external feed without an explicit release instruction/endpoint. Keep the Runner.Contracts assembly identity compatible and ensure the SDK target excludes it from plugin runtime output.
 - Verify SDK consumers from the packed local feed and run scripts/cluster_smoke.py on PostgreSQL and MSSQL for concurrency changes. It starts two processes and kills one to verify recovery.
+
+- Platform changes require scripts/platform_smoke.py on PostgreSQL/MSSQL. Keep node drain in the SQL claim predicate, manifest placement before candidate limits, admission locking before enqueue writes, and bounded scheduler/retention work.
+- Lease execution uses the sampled DB/monotonic ClusterClock; do not add per-job DB clock reads. Node heartbeat and idle dispatch timing must not scale with the configured slot count.
+- Process-mode package/function children must start before web/DB/auth initialization, scrub parent secrets, bound IPC, terminate on parent EOF and cancellation, and preserve parent-side lease fencing for logs/results. Process isolation is not an untrusted-code sandbox.
+- Enforce roles server-side, persist audit intent before authenticated mutations, omit payload/source/SQL/secrets, and keep session-version revocation plus OIDC code/PKCE validation. Run scripts/oidc_smoke.cjs for authentication changes.
+- Workflow dependencies must survive retention and manual retry; calendar changes need DST/misfire coverage. scripts/load_smoke.py measures idle command rate separately from job throughput; never claim local measurements certify production capacity.

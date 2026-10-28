@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory() as tmp:
         url='http://127.0.0.1:'+str(free_port())
         env=dict(os.environ,ASPNETCORE_ENVIRONMENT='Development',ASPNETCORE_URLS=url,Security__ApiKey=key,Security__KeyDirectory=tmp+'/'+name+'/keys',
             Storage__Provider=provider,Storage__ConnectionString=connection,Storage__Initialize='true',Runner__InstanceName=name,
-            Runner__Concurrency='2',Runner__PollMilliseconds='100',Runner__LeaseSeconds='10',Runner__HeartbeatSeconds='2',
+            Runner__Concurrency='2',Runner__PollMilliseconds='100',Runner__MaxIdlePollSeconds='1',Runner__NodeHeartbeatSeconds='1',Runner__LeaseSeconds='10',Runner__HeartbeatSeconds='2',
             Packages__CacheDirectory=tmp+'/'+name+'/packages')
         log=open(tmp+'/'+name+'.log','w+');logs.append(log)
         process=subprocess.Popen([dotnet,str(host)],cwd=cwd,env=env,stdout=log,stderr=log)

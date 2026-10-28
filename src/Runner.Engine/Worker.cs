@@ -8,48 +8,109 @@ using Runner.Contracts;
 namespace Runner.Engine;
 
 public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerCatalog catalog,
-    IOptions<RunnerOptions> options, ILogger<Worker> log) : BackgroundService
+    IOptions<RunnerOptions> options, ILogger<Worker> log, NodeRegistry nodes, QueueSignals signals, WorkflowService workflows) : BackgroundService
 {
     public static readonly ActivitySource Activities = new("Runner");
     private static readonly Meter Meter = new("Runner");
     private static readonly Counter<long> Finished = Meter.CreateCounter<long>("runner.jobs.finished");
     private static readonly Histogram<double> Duration = Meter.CreateHistogram<double>("runner.jobs.duration", "s");
     private readonly RunnerOptions config = options.Value;
-    private readonly string workerId = $"{options.Value.InstanceName ?? Environment.MachineName}:{Guid.NewGuid():N}";
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, CancellationTokenSource> cancellations = new();
+    private int active;
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken) => !config.WorkerEnabled
-        ? Task.CompletedTask : Task.WhenAll(Enumerable.Range(0, config.Concurrency).Select(_ => Loop(stoppingToken)).Append(Scheduler(stoppingToken)));
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (!config.WorkerEnabled) return;
+        await nodes.HeartbeatAsync(0, nodes.UtcNow, stoppingToken);
+        await Task.WhenAll(Control(stoppingToken), Dispatch(stoppingToken), Scheduler(stoppingToken));
+    }
 
-    private async Task Scheduler(CancellationToken ct)
+    private async Task Control(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                await store.DispatchSchedulesAsync(DateTime.UtcNow, ct);
-                await store.MaintainAsync(DateTime.UtcNow, config.RetentionDays, ct);
+                var wasDraining = nodes.Draining; var versions = nodes.CompatiblePackages;
+                await nodes.HeartbeatAsync(Volatile.Read(ref active), nodes.UtcNow, ct);
+                if (wasDraining != nodes.Draining || !ReferenceEquals(versions, nodes.CompatiblePackages)) signals.Pulse();
+                if (nodes.Draining && nodes.DrainDeadlineUtc <= nodes.UtcNow)
+                    foreach (var cancellation in cancellations.Values)
+                        try { await cancellation.CancelAsync(); } catch (ObjectDisposedException) { }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-            catch (Exception e) { log.LogError(e, "Schedule/maintenance cycle failed"); }
-            try { await Task.Delay(TimeSpan.FromSeconds(5), ct); }
+            catch (Exception e) { log.LogError(e, "Node heartbeat failed; new claims paused"); nodes.Draining = true; }
+            try { await Task.Delay(TimeSpan.FromSeconds(config.NodeHeartbeatSeconds), ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
         }
     }
 
-    private async Task Loop(CancellationToken ct)
+    private async Task Scheduler(CancellationToken ct)
     {
+        var maintenance = DateTime.MinValue;
+        var leadershipCheck = DateTime.MinValue;
+        bool leader = false;
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                var job = await store.ClaimAsync(workerId, DateTime.UtcNow, TimeSpan.FromSeconds(config.LeaseSeconds), ct);
-                if (job is not null) { await Run(job, ct); continue; }
+                var now = nodes.UtcNow;
+                if (now >= leadershipCheck)
+                {
+                    leader = await nodes.LeadAsync(now, ct);
+                    leadershipCheck = now.AddSeconds(config.NodeHeartbeatSeconds);
+                }
+                if (leader)
+                {
+                    var dispatched = await store.DispatchSchedulesAsync(now, ct);
+                    dispatched += await workflows.AdvanceAsync(now, ct);
+                    await store.RecoverAsync(now, ct);
+                    if (dispatched > 0) signals.Pulse();
+                    if (now >= maintenance)
+                    {
+                        var backlog = await store.MaintainAsync(now, config.RetentionDays, ct);
+                        maintenance = now.AddSeconds(backlog ? config.SchedulerSeconds : config.MaintenanceSeconds);
+                    }
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-            catch (Exception e) { log.LogError(e, "Worker cycle failed"); }
-            try { await Task.Delay(config.PollMilliseconds, ct); }
+            catch (Exception e) { log.LogError(e, "Schedule/maintenance cycle failed"); leader = false; leadershipCheck = DateTime.MinValue; }
+            try { await Task.Delay(TimeSpan.FromSeconds(config.SchedulerSeconds), ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
         }
+    }
+
+    private async Task Dispatch(CancellationToken ct)
+    {
+        var tasks = new List<Task>();
+        var backoff = new IdleBackoff(config.PollMilliseconds, config.MaxIdlePollSeconds);
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                tasks.RemoveAll(x => x.IsCompleted);
+                if (nodes.Draining || tasks.Count >= config.Concurrency)
+                { await signals.WaitAsync(TimeSpan.FromSeconds(1), ct); continue; }
+                try
+                {
+                    var job = await store.ClaimForNodeAsync(nodes, nodes.UtcNow, TimeSpan.FromSeconds(config.LeaseSeconds), ct);
+                    if (job is not null) { backoff.Reset(); tasks.Add(RunTracked(job, ct)); continue; }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception e) { log.LogError(e, "Worker cycle failed"); }
+                if (await signals.WaitAsync(backoff.Next(), ct)) backoff.Reset();
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        finally { await Task.WhenAll(tasks); }
+    }
+
+    private async Task RunTracked(Job job, CancellationToken ct)
+    {
+        Interlocked.Increment(ref active);
+        try { await Run(job, ct); }
+        catch (Exception e) { log.LogError(e, "Job finalization failed; lease recovery will retry"); }
+        finally { Interlocked.Decrement(ref active); signals.Pulse(); }
     }
 
     private async Task Run(Job job, CancellationToken stopping)
@@ -58,6 +119,7 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
         activity?.SetTag("job.id", job.Id).SetTag("job.type", job.Type).SetTag("job.attempt", job.Attempts);
         using var scopeLog = log.BeginScope(new Dictionary<string, object> { ["JobId"] = job.Id, ["JobType"] = job.Type, ["Attempt"] = job.Attempts });
         using var execution = CancellationTokenSource.CreateLinkedTokenSource(stopping);
+        cancellations[job.Id] = execution;
         execution.CancelAfter(TimeSpan.FromSeconds(config.JobTimeoutSeconds));
         using var heartbeatStop = CancellationTokenSource.CreateLinkedTokenSource(stopping);
         var heartbeat = Heartbeat(job, execution, heartbeatStop.Token);
@@ -82,13 +144,14 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
         catch (Exception e) { error = "handler_failed"; log.LogError("Job handler failed: {ErrorType}", e.GetType().Name); }
         finally
         {
+            cancellations.TryRemove(job.Id, out _);
             await heartbeatStop.CancelAsync();
             try { await heartbeat; } catch (OperationCanceledException) { }
         }
         // On shutdown leave ownership to expire; another process can recover the job.
         if (stopping.IsCancellationRequested) return;
         using var finalization = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var completed = await store.CompleteAsync(job, DateTime.UtcNow, error, finalization.Token, resultJson);
+        var completed = await store.CompleteAsync(job, nodes.UtcNow, error, finalization.Token, resultJson);
         if (!completed) log.LogWarning("Completion rejected: lease lost or cancellation requested");
         Finished.Add(1, new KeyValuePair<string, object?>("outcome", completed ? error ?? "succeeded" : "lease_lost"));
         Duration.Record(timer.Elapsed.TotalSeconds);
@@ -101,7 +164,7 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
             while (true)
             {
                 await Task.Delay(TimeSpan.FromSeconds(config.HeartbeatSeconds), ct);
-                if (!await store.RenewAsync(job.Id, job.LeaseToken!.Value, DateTime.UtcNow, TimeSpan.FromSeconds(config.LeaseSeconds), ct))
+                if (!await store.RenewAsync(job.Id, job.LeaseToken!.Value, nodes.UtcNow, TimeSpan.FromSeconds(config.LeaseSeconds), ct))
                 { await execution.CancelAsync(); return; }
             }
         }

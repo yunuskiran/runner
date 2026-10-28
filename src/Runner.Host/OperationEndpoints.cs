@@ -26,10 +26,10 @@ public static class OperationEndpoints
             await using var db = await factory.CreateDbContextAsync(ct);
             return await db.Attempts.AsNoTracking().Where(x => x.JobId == id).OrderByDescending(x => x.StartedUtc).Take(100).ToListAsync(ct);
         });
-        api.MapGet("/reports/summary", async (int? hours, IDbContextFactory<RunnerDb> factory, CancellationToken ct) => await Summary(factory, hours, ct));
-        api.MapGet("/reports/summary.csv", async (int? hours, IDbContextFactory<RunnerDb> factory, CancellationToken ct) =>
+        api.MapGet("/reports/summary", async (int? hours, IDbContextFactory<RunnerDb> factory, DashboardCache cache, CancellationToken ct) => await Summary(factory, hours, cache, ct));
+        api.MapGet("/reports/summary.csv", async (int? hours, IDbContextFactory<RunnerDb> factory, DashboardCache cache, CancellationToken ct) =>
         {
-            var rows = await Summary(factory, hours, ct);
+            var rows = await Summary(factory, hours, cache, ct);
             var text = new StringBuilder("JobType,Outcome,Count,AverageDurationMs\r\n");
             foreach (var row in rows) text.AppendLine($"{Csv(row.JobType)},{Csv(row.Outcome)},{row.Count},{row.AverageDurationMs.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
             return Results.File(Encoding.UTF8.GetBytes(text.ToString()), "text/csv", "runner-report.csv");
@@ -58,13 +58,13 @@ public static class OperationEndpoints
         if (value.Length > 0 && "=+-@\t\r\n".Contains(value[0])) value = "'" + value;
         return "\"" + value.Replace("\"", "\"\"") + "\"";
     }
-    private static async Task<List<ExecutionSummary>> Summary(IDbContextFactory<RunnerDb> factory, int? hours, CancellationToken ct)
+    private static async Task<List<ExecutionSummary>> Summary(IDbContextFactory<RunnerDb> factory, int? hours, DashboardCache cache, CancellationToken ct)
     {
         var since = DateTime.UtcNow.AddHours(-Math.Clamp(hours ?? 24, 1, 720));
         await using var db = await factory.CreateDbContextAsync(ct);
-        return await db.Attempts.AsNoTracking().Where(x => x.StartedUtc >= since).GroupBy(x => new { x.JobType, x.Outcome })
+        return await cache.ReadAsync("reports:" + Math.Clamp(hours ?? 24, 1, 720), () => db.Attempts.AsNoTracking().Where(x => x.StartedUtc >= since).GroupBy(x => new { x.JobType, x.Outcome })
             .OrderBy(g => g.Key.JobType).ThenBy(g => g.Key.Outcome)
-            .Select(g => new ExecutionSummary(g.Key.JobType, g.Key.Outcome, g.Count(), g.Average(x => x.DurationMilliseconds) ?? 0)).ToListAsync(ct);
+            .Select(g => new ExecutionSummary(g.Key.JobType, g.Key.Outcome, g.Count(), g.Average(x => x.DurationMilliseconds) ?? 0)).ToListAsync(ct), ct);
     }
     public static bool ValidPayload(string type, JsonElement payload, DatabaseCommands database, ApplicationCommands apps)
     {

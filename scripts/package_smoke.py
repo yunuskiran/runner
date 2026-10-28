@@ -77,6 +77,8 @@ with tempfile.TemporaryDirectory() as tmp:
             assert activate('2.0.0')[0]==204
             result=wait_job(pinned['id']);assert result['packageVersion']=='1.0.0'
             assert json.loads(result['resultJson'])['greeting']=='Hello, package-test!'
+            logs=request('/api/jobs/'+pinned['id']+'/logs')[1]
+            assert any('Echo plugin business log' in row['message'] for row in logs),logs
             code,paused=submit('1.0.0',delay=2,name='paused');assert code==201
             assert activate(None,False)[0]==204
             time.sleep(3)

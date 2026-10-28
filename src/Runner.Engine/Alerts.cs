@@ -46,18 +46,20 @@ public sealed class AlertStore(IDbContextFactory<RunnerDb> factory)
 }
 
 public sealed class AlertDispatcher(AlertStore store, IHttpClientFactory clients, IOptions<AlertOptions> options,
-    ILogger<AlertDispatcher> log) : BackgroundService
+    ILogger<AlertDispatcher> log, AlertSignals signals, ClusterClock clock) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!options.Value.DeliveryEnabled || string.IsNullOrWhiteSpace(options.Value.WebhookUrl)) return;
+        var backoff = new IdleBackoff(1000, 30);
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                var alert = await store.ClaimAsync(DateTime.UtcNow, stoppingToken);
+                var alert = await store.ClaimAsync(clock.UtcNow, stoppingToken);
                 if (alert is not null)
                 {
+                    backoff.Reset();
                     bool success = false;
                     try
                     {
@@ -70,13 +72,13 @@ public sealed class AlertDispatcher(AlertStore store, IHttpClientFactory clients
                     catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
                     catch (Exception e) when (e is HttpRequestException or OperationCanceledException)
                     { log.LogWarning("Alert transport failed for {AlertId}; delivery will retry", alert.Id); }
-                    await store.FinishAsync(alert, success, DateTime.UtcNow, stoppingToken);
+                    await store.FinishAsync(alert, success, clock.UtcNow, stoppingToken);
                     continue;
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception e) { log.LogError("Alert dispatch cycle failed: {ErrorType}", e.GetType().Name); }
-            try { await Task.Delay(1000, stoppingToken); }
+            try { await signals.WaitAsync(backoff.Next(), stoppingToken); }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
         }
     }

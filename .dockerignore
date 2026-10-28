@@ -5,3 +5,6 @@
 **/TestResults
 .env
 artifacts
+
+**/node_modules
+**/__pycache__

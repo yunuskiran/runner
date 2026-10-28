@@ -3,6 +3,7 @@ namespace Runner.Engine.Packaging;
 
 public sealed class PluginPackage
 {
+    public string ManifestJson { get; set; } = "{}";
     public PluginExecutionMode DefaultExecutionMode { get; set; }
     public string PackageId { get; set; } = "";
     public string Version { get; set; } = "";
@@ -14,6 +15,7 @@ public sealed class PluginPackage
 }
 public sealed class PluginChannel
 {
+    public int? MaxConcurrency { get; set; }
     public PluginExecutionMode ExecutionMode { get; set; }
     public Guid? ExecutionToken { get; set; }
     public DateTime? ExecutionLeaseUtc { get; set; }
@@ -36,6 +38,8 @@ public sealed class PackageConflictException(string message) : Exception(message
 
 public sealed class PackageChange
 {
+    public int? PreviousMaxConcurrency { get; set; }
+    public int? MaxConcurrency { get; set; }
     public PluginExecutionMode PreviousExecutionMode { get; set; }
     public PluginExecutionMode ExecutionMode { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();

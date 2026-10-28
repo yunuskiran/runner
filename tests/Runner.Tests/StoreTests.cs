@@ -7,10 +7,11 @@ using Microsoft.Extensions.Options;
 using Xunit;
 namespace Runner.Tests;
 
-public sealed class StoreTests : IAsyncLifetime
+public sealed partial class StoreTests : IAsyncLifetime
 {
     private TestFactory factory = null!;
     private JobStore store = null!;
+    private readonly string packageCache = Path.Combine(Path.GetTempPath(), "runner-package-test-" + Guid.NewGuid().ToString("N"));
     private readonly DateTime now = new(DateTime.UtcNow.Ticks / 10 * 10, DateTimeKind.Utc);
     public async Task InitializeAsync()
     {
@@ -28,7 +29,7 @@ public sealed class StoreTests : IAsyncLifetime
         factory = new TestFactory(options.Options); store = new JobStore(factory);
         await using var db = factory.CreateDbContext(); await db.Database.EnsureCreatedAsync();
     }
-    public async Task DisposeAsync() { await using var db = factory.CreateDbContext(); await db.Database.EnsureDeletedAsync(); }
+    public async Task DisposeAsync() { await using var db = factory.CreateDbContext(); await db.Database.EnsureDeletedAsync(); PackageManager.TryDelete(packageCache); }
     private async Task<Job> Add(int attempts = 3)
     {
         await using var db = factory.CreateDbContext();
@@ -187,7 +188,7 @@ public sealed class StoreTests : IAsyncLifetime
         await SchemaUpgrade.ApplyOperationsAsync(db); await SchemaUpgrade.ApplyOperationsAsync(db);
         Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.Attempts.ToListAsync());
     }
-    private PackageManager PackageService() => new(factory, Options.Create(new PackageOptions { CacheDirectory = Path.Combine(Path.GetTempPath(), "runner-packages-tests") }));
+    private PackageManager PackageService() => new(factory, Options.Create(new PackageOptions { CacheDirectory = packageCache }));
     private static PackageFile[] FixtureFiles() => Directory.GetFiles(Path.Combine(AppContext.BaseDirectory, "package-fixture"))
         .Select(path => new PackageFile(Path.GetFileName(path), File.ReadAllBytes(path))).ToArray();
     [Fact] public async Task Package_install_is_immutable_and_repeatable()
@@ -254,8 +255,9 @@ public sealed class StoreTests : IAsyncLifetime
     [Fact] public async Task Package_upgrade_preserves_existing_jobs_and_is_repeatable()
     {
         var job = await Add(); await using var db = factory.CreateDbContext();
+        await RemovePlatformSchemaAsync(db);
         await db.Database.ExecuteSqlRawAsync("DROP TABLE \"PluginPackages\"; DROP TABLE \"PluginChannels\"; DROP TABLE \"PackageChanges\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageVersion\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageVersion\";");
-        await SchemaUpgrade.ApplyConcurrencyAsync(db); await SchemaUpgrade.ApplyConcurrencyAsync(db);
+        await SchemaUpgrade.ApplyPlatformAsync(db); await SchemaUpgrade.ApplyPlatformAsync(db);
         Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.PluginPackages.Select(x => x.PackageId).ToListAsync());
         var packages = PackageService();
         foreach (var version in new[] { "1.0.0-rc.1", "1.0.0-RC.1" })
@@ -361,7 +363,7 @@ public sealed class StoreTests : IAsyncLifetime
         await SeedPluginJobs(PluginExecutionMode.Sequential, 2);
         var first = (await Claim())!;
         await using (var db = factory.CreateDbContext())
-            await db.Jobs.Where(x => x.Id == first.Id).ExecuteUpdateAsync(s => s.SetProperty(x => x.AvailableUtc, now.AddHours(1)));
+            await db.Jobs.Where(x => x.Id == first.Id).ExecuteUpdateAsync(s => s.SetProperty(x => x.AvailableUtc, now.AddHours(1)).SetProperty(x => x.PriorityUtc, now.AddHours(1)));
         var next = (await Claim(now.AddSeconds(31)))!; Assert.NotEqual(first.Id, next.Id);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.WriteLogAsync(first, "Information", "stale owner", default));
     }

@@ -71,6 +71,44 @@ jobs:
       - run: python3 scripts/package_smoke.py
         env:
           SMOKE_MSSQL: Server=localhost,1433;Database=runner_mssql_packages_smoke;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
+      - run: python3 scripts/platform_smoke.py
+        env:
+          SMOKE_POSTGRES: Host=localhost;Database=runner_platform_pg;Username=postgres;Password=ci-test-only
+      - run: python3 scripts/platform_smoke.py
+        env:
+          SMOKE_MSSQL: Server=localhost,1433;Database=runner_platform_sql;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: scripts/browser-tests/package-lock.json
+      - run: npm ci --prefix scripts/browser-tests --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+        working-directory: scripts/browser-tests
+      - run: node -e "const fs=require('fs'),path=require('path'),p=require('./scripts/browser-tests/node_modules/playwright');fs.appendFileSync(process.env.GITHUB_ENV,'NODE_PATH='+path.resolve('scripts/browser-tests/node_modules')+'\nCHROMIUM_PATH='+p.chromium.executablePath()+'\n');"
+      - run: node scripts/oidc_smoke.cjs
+      - run: python3 scripts/platform_browser.py
+      - run: python3 scripts/fault_smoke.py
+        env:
+          SMOKE_POSTGRES: Host=localhost;Database=runner_fault_pg;Username=postgres;Password=ci-test-only
+      - run: python3 scripts/fault_smoke.py
+        env:
+          SMOKE_MSSQL: Server=localhost,1433;Database=runner_fault_sql;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
+      - run: python3 scripts/load_smoke.py
+        env:
+          SMOKE_POSTGRES: Host=localhost;Database=runner_load_pg;Username=postgres;Password=ci-test-only
+      - run: dotnet restore tools/Runner.Recovery --locked-mode
+      - run: dotnet build tools/Runner.Recovery -c Release --no-restore
+      - run: dotnet tools/Runner.Recovery/bin/Release/net10.0/Runner.Recovery.dll
+        env:
+          RECOVERY_PROVIDER: Postgres
+          RECOVERY_CONNECTION: Host=localhost;Username=postgres;Password=ci-test-only
+          RECOVERY_CONTAINER: ${{ job.services.postgres.id }}
+      - run: dotnet tools/Runner.Recovery/bin/Release/net10.0/Runner.Recovery.dll
+        env:
+          RECOVERY_PROVIDER: Mssql
+          RECOVERY_CONNECTION: Server=localhost,1433;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
+          RECOVERY_CONTAINER: ${{ job.services.mssql.id }}
       - run: dotnet publish src/Runner.Host -c Release --no-restore -o artifacts/publish
       - run: docker build -t runner:ci .
       - uses: actions/upload-artifact@v4
@@ -80,3 +118,15 @@ jobs:
             artifacts/nuget/*.nupkg
             artifacts/nuget/*.snupkg
             artifacts/nuget/checksums.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: platform-validation
+          path: |
+            artifacts/load-*.json
+            artifacts/recovery-*.json
+            docs/images/worker-*.png
+            docs/images/dependency-workflows.png
+            docs/images/calendar-schedules.png
+            docs/images/audit-trail.png
+            tests/Runner.Tests/TestResults/*.trx

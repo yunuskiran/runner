@@ -1,0 +1,143 @@
+{
+  "date": "2026-10-29",
+  "timezone": "Australia/Sydney",
+  "environment": "Managed Linux development workspace; local PostgreSQL 17 and SQL Server 2022 Developer test containers. Shared development hardware; not a production capacity/RTO/RPO certification.",
+  "configuration": {
+    "nodes": 2,
+    "slotsPerNode": 8,
+    "pollMinimumMs": 1000,
+    "pollIdleMaxSeconds": 30,
+    "nodeHeartbeatSeconds": 10,
+    "schedulerSeconds": 5,
+    "normalMaintenanceSeconds": 300,
+    "jobsPerLoadRun": 100,
+    "idleMeasurementSeconds": 30
+  },
+  "load": [
+    {
+      "provider": "Sqlite",
+      "jobs": 100,
+      "seconds": 8.65703790000407,
+      "jobsPerSecond": 11.551295160663786,
+      "p50EndToEndMs": 231.2375,
+      "p95EndToEndMs": 1065.501,
+      "loadCommands": {
+        "load-a": {
+          "readers": 996,
+          "writes": 474,
+          "scalars": 0
+        },
+        "load-b": {
+          "readers": 103,
+          "writes": 63,
+          "scalars": 0
+        }
+      },
+      "idleSeconds": 30.00014242900943,
+      "idleCommands": {
+        "load-a": {
+          "readers": 34,
+          "writes": 6,
+          "scalars": 0
+        },
+        "load-b": {
+          "readers": 13,
+          "writes": 6,
+          "scalars": 0
+        }
+      },
+      "idleClusterCommandsPerSecond": 1.9666573296981549,
+      "notes": "Two local processes, 8 slots each. Includes API/audit/validation traffic; shared development hardware. EF command counts exclude transaction protocol round trips. Not a production sizing result."
+    },
+    {
+      "provider": "Postgres",
+      "jobs": 100,
+      "seconds": 4.999188155008596,
+      "jobsPerSecond": 20.003247907325072,
+      "p50EndToEndMs": 99.523,
+      "p95EndToEndMs": 351.649,
+      "loadCommands": {
+        "load-a": {
+          "readers": 878,
+          "writes": 479,
+          "scalars": 0
+        },
+        "load-b": {
+          "readers": 74,
+          "writes": 56,
+          "scalars": 0
+        }
+      },
+      "idleSeconds": 30.00009217900515,
+      "idleCommands": {
+        "load-a": {
+          "readers": 34,
+          "writes": 6,
+          "scalars": 0
+        },
+        "load-b": {
+          "readers": 13,
+          "writes": 6,
+          "scalars": 0
+        }
+      },
+      "idleClusterCommandsPerSecond": 1.966660623839341,
+      "notes": "Two local processes, 8 slots each. Includes API/audit/validation traffic; shared development hardware. EF command counts exclude transaction protocol round trips. Not a production sizing result."
+    },
+    {
+      "provider": "Mssql",
+      "jobs": 100,
+      "seconds": 5.615575705000083,
+      "jobsPerSecond": 17.807613191103535,
+      "p50EndToEndMs": 154.70600000000002,
+      "p95EndToEndMs": 603.643,
+      "loadCommands": {
+        "load-a": {
+          "readers": 836,
+          "writes": 468,
+          "scalars": 0
+        },
+        "load-b": {
+          "readers": 108,
+          "writes": 81,
+          "scalars": 0
+        }
+      },
+      "idleSeconds": 30.000108601001557,
+      "idleCommands": {
+        "load-a": {
+          "readers": 34,
+          "writes": 6,
+          "scalars": 0
+        },
+        "load-b": {
+          "readers": 13,
+          "writes": 6,
+          "scalars": 0
+        }
+      },
+      "idleClusterCommandsPerSecond": 1.966659547293448,
+      "notes": "Two local processes, 8 slots each. Includes API/audit/validation traffic; shared development hardware. EF command counts exclude transaction protocol round trips. Not a production sizing result."
+    }
+  ],
+  "nativeRecovery": [
+    {
+      "provider": "Postgres",
+      "restoreSeconds": 4.3131339,
+      "jobsVerified": 1,
+      "archiveBytesVerified": 262144,
+      "sourceAndCalendarVerified": true,
+      "repeatableUpgradeVerified": true,
+      "note": "Disposable local databases, not production RTO/RPO certification."
+    },
+    {
+      "provider": "Mssql",
+      "restoreSeconds": 4.382283,
+      "jobsVerified": 1,
+      "archiveBytesVerified": 262144,
+      "sourceAndCalendarVerified": true,
+      "repeatableUpgradeVerified": true,
+      "note": "Disposable local databases, not production RTO/RPO certification."
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+let sessionRoles = null;
 const $ = id => document.getElementById(id);
 let page = 0, refreshing = false, scriptingEnabled = false, functionPage = 0, selectedFunction = null, resources = null, alertPage = 0, packagesEnabled = false, packagePage = 0, versionPage = 0, selectedPackage = null, selectedPackageVersion = null, packageFiles = [], packageChannels = [], renderedPolicyKey = null;
 const esc = v => String(v ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
@@ -17,19 +18,21 @@ async function refresh() {
   try {
     const [stats,jobs,schedules] = await Promise.all([api('/stats'),api(`/jobs?page=${page}&${$('filter').value ? 'state='+$('filter').value : ''}`),api('/schedules')]);
     $('overview').innerHTML=['Pending','Running','Succeeded','DeadLetter','Cancelled'].map(s=>`<article><span>${s==='DeadLetter'?'Dead letter':s}</span><strong>${stats.find(x=>x.state===s)?.count??0}</strong><small>${s==='Running'?'Leased to a worker':s==='DeadLetter'?'Needs attention':'In retained history'}</small></article>`).join('');
-    $('rows').innerHTML=jobs.length?jobs.map(j=>`<tr><td><strong>${esc(j.type)}</strong><small>${esc(j.id)}</small></td><td><span class="badge ${esc(j.state.toLowerCase())}">${esc(j.state)}</span>${j.cancellationRequested?'<small>Cancellation requested</small>':''}${j.errorCode?`<small>${esc(j.errorCode)}</small>`:''}</td><td>${j.attempts} <span class="muted">/ ${j.maxAttempts}</span></td><td>${esc(new Date(j.createdUtc).toLocaleString())}</td><td>${['Pending','Running'].includes(j.state)?`<button class="text" data-action="cancel" data-id="${j.id}">Cancel</button>`:['DeadLetter','Cancelled'].includes(j.state)?`<button class="text" data-action="retry" data-id="${j.id}">Retry</button>`:'—'}<button class="text" data-action="details" data-id="${j.id}">Details</button></td></tr>`).join(''):'<tr><td colspan="5" class="empty">No jobs here yet. Dispatch one to get started.</td></tr>';
+    $('rows').innerHTML=jobs.length?jobs.map(j=>`<tr><td><strong>${esc(j.type)}</strong><small>${esc(j.id)}</small></td><td><span class="badge ${esc(j.state.toLowerCase())}">${esc(j.state)}</span>${j.cancellationRequested?'<small>Cancellation requested</small>':''}${j.errorCode?`<small>${esc(j.errorCode)}</small>`:''}</td><td>${j.attempts} <span class="muted">/ ${j.maxAttempts}</span></td><td>${esc(new Date(j.createdUtc).toLocaleString())}</td><td>${['Pending','Running','Blocked'].includes(j.state)?`<button class="text" data-action="cancel" data-id="${j.id}">Cancel</button>`:['DeadLetter','Cancelled'].includes(j.state)?`<button class="text" data-action="retry" data-id="${j.id}">Retry</button>`:'—'}<button class="text" data-action="details" data-id="${j.id}">Details</button></td></tr>`).join(''):'<tr><td colspan="5" class="empty">No jobs here yet. Dispatch one to get started.</td></tr>';
     $('page').textContent=`Page ${page+1}`; $('prev').disabled=page===0; $('next').disabled=jobs.length<50;
-    $('schedule-list').innerHTML=schedules.length?schedules.map(s=>`<div class="schedule-item"><strong>${esc(s.type)}</strong><span>Every ${s.intervalSeconds}s · next ${esc(new Date(s.nextUtc).toLocaleString())}</span><button class="text" data-schedule="${s.id}">Delete</button></div>`).join(''):'<p>No recurring schedules.</p>';
+    $('schedule-list').innerHTML=schedules.length?schedules.map(s=>`<div class="schedule-item"><strong>${esc(s.type)}</strong><span>${s.cron?esc(s.cron)+' · '+esc(s.timeZoneId):'Every '+s.intervalSeconds+'s'} · next ${esc(new Date(s.nextUtc).toLocaleString())}</span><button class="text" data-schedule="${s.id}">Delete</button></div>`).join(''):'<p>No recurring schedules.</p>';
     if(scriptingEnabled) await refreshFunctions();
     await refreshOperations();
     if(packagesEnabled) await refreshPackages();
+    await refreshPlatform();
+    applyPermissions();
     $('updated').textContent='Updated '+new Date().toLocaleTimeString();
     if($('status').textContent.startsWith('Connecting'))status('Control plane connected · persistent job storage');
   } catch(e) {status(e.message,true);} finally {refreshing=false;}
 }
 async function act(fn, message) {try{await fn();status(message);await refresh();}catch(e){status(e.message,true);}}
-$('dispatch').onsubmit=e=>{e.preventDefault();act(()=>api('/jobs','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),maxAttempts:Number($('attempts').value),delaySeconds:Number($('delay').value),idempotencyKey:$('key').value||null}),'Job accepted.');};
-$('schedule').onsubmit=e=>{e.preventDefault();act(()=>api('/schedules','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),intervalSeconds:Number($('interval').value)}),'Schedule created.');};
+$('dispatch').onsubmit=e=>{e.preventDefault();act(()=>api('/jobs','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),maxAttempts:Number($('attempts').value),delaySeconds:Number($('delay').value),idempotencyKey:$('key').value||null,queue:$('job-queue').value,priority:Number($('job-priority').value)}),'Job accepted.');};
+$('schedule').onsubmit=e=>{e.preventDefault();act(()=>api('/schedules','POST',{type:$('handler').value,payload:JSON.parse($('payload').value),intervalSeconds:Number($('interval').value),cron:$('cron-expression').value||null,timeZoneId:$('cron-timezone').value,misfirePolicy:$('cron-misfire').value}),'Schedule created.');};
 $('rows').onclick=e=>{const b=e.target.closest('[data-action]');if(!b)return;
   if(b.dataset.action==='details') act(async()=>{$('detail-title').textContent='Job details';const [job,attempts,logs]=await Promise.all([api(`/jobs/${b.dataset.id}`),api(`/jobs/${b.dataset.id}/attempts`),api(`/jobs/${b.dataset.id}/logs`)]);$('job-detail-content').textContent=JSON.stringify({...job,result:job.resultJson ? JSON.parse(job.resultJson) : null,attempts,logs},null,2);$('job-detail').showModal();},'Job details loaded.');
   else act(()=>api(`/jobs/${b.dataset.id}/${b.dataset.action}`,'POST'),'Operation accepted.');
@@ -38,7 +41,7 @@ $('schedule-list').onclick=e=>{const b=e.target.closest('[data-schedule]');if(b&
 $('filter').onchange=()=>{page=0;refresh();}; $('prev').onclick=()=>{page=Math.max(0,page-1);refresh();}; $('next').onclick=()=>{page++;refresh();};
 $('logout').onclick=()=>act(async()=>{await api('/logout','POST');location.href='/login';},'Signed out.');
 api('/handlers').then(h=>{$('handler').innerHTML=h.map(x=>`<option>${esc(x)}</option>`).join('');if(h.includes('sample.echo'))$('handler').value='sample.echo';return refresh();}).catch(e=>status(e.message,true));
-setInterval(refresh,5000);
+setInterval(()=>{if(!document.hidden)refresh();},15000);
 
 async function refreshFunctions() {
   const functions = await api(`/functions?page=${functionPage}`);
@@ -143,7 +146,7 @@ async function currentChannel() {
 async function refreshPackageVersions() {
   const versions=await api(`/packages/${encodeURIComponent(selectedPackage)}/versions?page=${versionPage}`);
   const channel=await currentChannel();
-  const policyKey=`${selectedPackage}:${channel.revision}`;if(renderedPolicyKey!==policyKey){$('package-mode').value=channel.executionMode;renderedPolicyKey=policyKey;}
+  const policyKey=`${selectedPackage}:${channel.revision}`;if(renderedPolicyKey!==policyKey){$('package-mode').value=channel.executionMode;$('package-limit').value=channel.maxConcurrency??'';renderedPolicyKey=policyKey;}
   $('package-version-panel').hidden=false;$('package-version-title').textContent=`${selectedPackage} · installed versions`;
   $('package-version-rows').innerHTML=versions.map(v=>`<tr><td><strong>${esc(v.version)}</strong>${channel.activeVersion===v.version?'<small>Active version</small>':''}</td><td>${esc(v.entryAssembly)}<small>${esc(v.entryType)} · default ${esc(v.defaultExecutionMode)}</small></td><td><small title="${esc(v.digest)}">${esc(v.digest.slice(0,16))}…</small></td><td><button class="text" data-version="${esc(v.version)}" data-version-action="select">Select</button><button class="text" data-version="${esc(v.version)}" data-version-action="activate">${channel.activeVersion===v.version?'Enable / keep active':'Activate / rollback'}</button></td></tr>`).join('');
   $('versions-page').textContent=`Page ${versionPage+1}`;$('versions-prev').disabled=versionPage===0;$('versions-next').disabled=versions.length<50;
@@ -179,5 +182,30 @@ api('/packages/settings').then(async settings=>{packagesEnabled=settings.enabled
 
 $('package-mode-save').onclick=()=>act(async()=>{
   const desiredMode=$('package-mode').value;const channel=await currentChannel();
-  await api(`/packages/${encodeURIComponent(selectedPackage)}/activation`,'POST',{version:channel.activeVersion,enabled:channel.enabled,revision:channel.revision,executionMode:desiredMode});
+  await api(`/packages/${encodeURIComponent(selectedPackage)}/activation`,'POST',{version:channel.activeVersion,enabled:channel.enabled,revision:channel.revision,executionMode:desiredMode,maxConcurrency:$('package-limit').value?Number($('package-limit').value):null,setLimit:true});
 },'Cluster execution policy updated.');
+
+function applyPermissions() {
+  if(!sessionRoles)return;
+  const admin=sessionRoles.includes('Admin'),operator=sessionRoles.includes('Operator');
+  for(const form of document.querySelectorAll('form')) {
+    const needed=['package-install','register-function'].includes(form.id)?admin:operator;
+    if(!needed)for(const control of form.querySelectorAll('input,select,textarea,button'))control.disabled=true;
+  }
+  for(const selector of ['[data-action="cancel"]','[data-action="retry"]','[data-alert]','#package-run','#package-schedule','#run-function'])
+    if(!operator)for(const button of document.querySelectorAll(selector))button.disabled=true;
+  for(const selector of ['[data-node-drain]','[data-package-action="disable"]','[data-version-action="activate"]','[data-function-action="enable"]','[data-function-action="disable"]','#package-mode-save','#package-mode','#package-limit','#audit-refresh'])
+    if(!admin)for(const button of document.querySelectorAll(selector))button.disabled=true;
+}
+async function refreshPlatform() {
+  const [nodes,workflows]=await Promise.all([api('/nodes'),api('/workflows')]);
+  $('node-list').innerHTML=nodes.length?nodes.map(n=>`<div class="package-item"><div><strong>${esc(n.name)} · ${esc(n.state)}</strong><small>${esc(n.id)}</small><small>${n.activeJobs} / ${n.concurrency} slots · last seen ${esc(new Date(n.heartbeatUtc).toLocaleString())}</small><small>${esc(JSON.parse(n.capabilitiesJson).os)} / ${esc(JSON.parse(n.capabilitiesJson).architecture)}</small></div><button class="secondary" data-node-drain="${esc(n.id)}" data-enable="${!n.drainRequested}">${n.drainRequested?'Resume claims':'Drain server'}</button></div>`).join(''):'<p>No worker nodes registered. API-only hosts do not register execution capacity.</p>';
+  $('workflow-list').innerHTML=workflows.length?workflows.map(w=>`<div class="schedule-item"><strong>${esc(w.name)}</strong><small>${esc(w.id)}</small><button class="text" data-workflow="${esc(w.id)}">Inspect steps</button></div>`).join(''):'<p>No workflows created yet.</p>';
+}
+$('nodes-refresh').onclick=()=>act(refreshPlatform,'Server inventory refreshed.');
+$('node-list').onclick=e=>{const b=e.target.closest('[data-node-drain]');if(b)act(()=>api('/nodes/'+encodeURIComponent(b.dataset.nodeDrain)+'/drain','POST',{enabled:b.dataset.enable==='true',deadlineSeconds:Number($('drain-deadline').value)}),'Server drain request saved.');};
+$('workflow-create').onsubmit=e=>{e.preventDefault();act(()=>api('/workflows','POST',{name:$('workflow-name').value,steps:JSON.parse($('workflow-steps').value)}),'Workflow created.');};
+$('workflow-list').onclick=e=>{const b=e.target.closest('[data-workflow]');if(b)act(async()=>{$('detail-title').textContent='Workflow steps and dependencies';$('job-detail-content').textContent=JSON.stringify(await api('/workflows/'+b.dataset.workflow),null,2);$('job-detail').showModal();},'Workflow loaded.');};
+$('audit-refresh').onclick=()=>act(async()=>{const entries=await api('/audit');$('audit-list').innerHTML=entries.map(a=>`<div class="package-item"><div><strong>${esc(a.actor)}</strong><small>${esc(a.method)} ${esc(a.path)} · ${a.statusCode??'Incomplete'} · ${esc(new Date(a.startedUtc).toLocaleString())}</small></div></div>`).join('')||'<p>No audit entries.</p>';},'Audit trail loaded.');
+$('package-placement').onclick=()=>act(async()=>{if(!selectedPackageVersion)throw Error('Select a package version first.');$('detail-title').textContent='Plugin compatibility by server';$('job-detail-content').textContent=JSON.stringify(await api('/packages/'+encodeURIComponent(selectedPackage)+'/versions/'+encodeURIComponent(selectedPackageVersion)+'/placement'),null,2);$('job-detail').showModal();},'Compatibility report loaded.');
+api('/session').then(session=>{sessionRoles=session.roles;$('session-identity').textContent=`${session.name} · ${session.roles.join(', ')}`;applyPermissions();}).catch(e=>{sessionRoles=[];applyPermissions();status(e.message,true);});

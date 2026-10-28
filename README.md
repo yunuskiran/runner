@@ -2,9 +2,9 @@
 
 A plugin-based durable worker with an operations dashboard, built with .NET 10 and the latest C# for cloud and on-premises deployments. Runs without Quartz, Hangfire, or Redis. Workers keep durable job state in the database and coordinate through it.
 
-**Status:** a working, tested foundation. Complete the operational requirements below before production deployment. Load testing, an independent security review, and validation in a real deployment have not yet been performed.
+**Status:** a tested foundation with cluster operations, isolated package/script execution and dependency workflows. Complete deployment-specific capacity, security and recovery validation before production rollout; local integration evidence is recorded in [validation](docs/validation.md).
 
-See the [prioritized roadmap](docs/ROADMAP.md) for remaining product features and production validation work.
+See [cluster operations and configuration](docs/platform.md) for server drain, manifest placement, OIDC/RBAC/audit, process isolation, queue limits, cron/time zones, workflows and database-cost controls. The [roadmap](docs/ROADMAP.md) records remaining limits.
 
 ## Dashboard
 
@@ -12,10 +12,18 @@ Real screenshots captured from the running application. The function registry is
 
 ![Plugin package manager](docs/images/package-manager.png)
 
+![Worker server inventory and drain](docs/images/worker-servers.png)
+
 ![Runner operations dashboard](docs/images/dashboard.png)
 
 <details>
-<summary>Package history, functions, operations, and job results</summary>
+<summary>Workflows, calendar, audit, packages, functions, operations, and job results</summary>
+
+![Dependency workflows](docs/images/dependency-workflows.png)
+
+![Calendar and time zone schedules](docs/images/calendar-schedules.png)
+
+![Operator audit trail](docs/images/audit-trail.png)
 
 ![Plugin activation and rollback history](docs/images/package-history.png)
 
@@ -74,9 +82,9 @@ Delivery is **at least once**. Workers claim jobs through conditional database u
 
 Lease fencing protects Runner's state. Plugin writes to external systems are not part of the same transaction: use `JobContext.JobId` for idempotency, a unique constraint, or a transactional outbox for external side effects. An API idempotency key returns the stored job for the same type and payload; a different payload returns 409. When retention removes a successful or cancelled job, its key becomes available again. Deduplication is not permanent.
 
-Retries use bounded exponential backoff with jitter, with a maximum of 20 attempts and a default of 5. Dead-letter jobs are not deleted automatically. Timeouts and cancellation are **cooperative**: handlers must respect the cancellation token. Untrusted code or code that ignores cancellation requires a separate process or container. In-process plugin isolation is not a security boundary.
+Retries use bounded exponential backoff with jitter, with a maximum of 20 attempts and a default of 5. Dead-letter jobs are not deleted automatically. Dashboard packages and Roslyn functions use a separate child process by default, with cooperative cancellation followed by bounded process termination. Legacy/in-process handlers still require cooperative cancellation. Process isolation is not a security sandbox; untrusted code requires an OS/container security boundary.
 
-The scheduler uses fixed UTC intervals of at least 10 seconds. It does not provide cron or time zone scheduling. Missed ticks coalesce into one job; schedule advancement and enqueueing commit in a single transaction. Deleting a schedule does not remove jobs already queued. Keep all host clocks synchronized with NTP; lease checks use the application's UTC clock.
+The scheduler supports fixed intervals of at least 10 seconds and five-field cron with named time zones. Choose Coalesce, Skip or bounded CatchUp for missed occurrences; schedule advancement and enqueueing commit in a single transaction. Deleting a schedule does not remove jobs already queued. Workers sample the database clock on node heartbeats and advance lease time monotonically between samples. Keep clocks/tzdata managed for operational and business timestamps.
 
 ## Multiple servers and plugin execution policy
 
@@ -104,11 +112,11 @@ public sealed class InvoicePlugin : IRunnerPlugin
 }
 ```
 
-An absent attribute defaults to `Parallel`, preserving older plugin behavior. The attribute initializes the channel when a package ID is first installed. Later package uploads do not silently override an operator's policy. The dashboard shows each version's declared default and offers a **Cluster execution mode** selector. Saving a policy uses the current revision and is recorded in activation history. Changing modes while any valid job lease remains returns 409: disable the package, let running jobs drain, change the policy, then enable it again. All nodes must be upgraded to schema/host version 5 before enabling sequential policy; older hosts do not participate in that lease gate.
+An absent attribute defaults to `Parallel`, preserving older plugin behavior. The attribute initializes the channel when a package ID is first installed. Later package uploads do not silently override an operator's policy. The dashboard shows each version's declared default and offers a **Cluster execution mode** selector. Saving a policy uses the current revision and is recorded in activation history. Changing modes while any valid job lease remains returns 409: disable the package, let running jobs drain, change the policy, then enable it again. All nodes must be upgraded to schema version 6 and this host release before enabling the new cluster policies; older hosts do not participate in that lease gate.
 
 The sequential gate is a DB row/lease, acquired in the job-claim transaction and renewed with the job heartbeat. Completion/retry releases it atomically. A worker crash leaves the gate until its lease expires, then another node can recover work. Stale tokens cannot renew or finalize the gate or job. Disabling a package pauses new starts and schedule ticks while already claimed jobs can complete.
 
-`Sequential` controls overlap. Eligible jobs are selected by due time, then creation time; a job waiting for its retry backoff or a future due time may allow another due job to run. It is not a dependency workflow that requires one job to succeed before another. Delivery remains at least once. A paused, partitioned, or cancellation-ignoring old process can continue external side effects after losing a lease, so this policy guarantees one **valid lease**, not physical exclusion of arbitrary uncooperative code. Honor cancellation and use idempotency/fencing at the external system for side effects that require stronger protection.
+`Sequential` controls overlap. Eligible jobs use priority-adjusted creation time with aging; a job waiting for its retry backoff or a future due time may allow another due job to run. Use the separate dependency workflow API when one job must succeed before another starts. Delivery remains at least once. A paused, partitioned, or cancellation-ignoring old process can continue external side effects after losing a lease, so this policy guarantees one **valid lease**, not physical exclusion of arbitrary uncooperative code. Honor cancellation and use idempotency/fencing at the external system for side effects that require stronger protection.
 
 Configure a node:
 
@@ -124,10 +132,10 @@ Use the same database connection on `worker-b` with its own instance name and lo
 Existing installations need the explicit, repeatable upgrade with **all workers stopped** and a backup available:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-concurrency
+dotnet Runner.Host.dll --upgrade-platform
 ```
 
-It applies earlier upgrades and adds version 5 policy/lease fields while retaining installed versions and defaulting existing channels to `Parallel`. The development script handles this locally.
+It applies versions 2–6, including node inventory, manifests, audit, bounded concurrency and workflow/calendar fields, while preserving installed versions and existing policies. The development script handles this locally.
 
 ## NuGet SDK for plugin authors
 
@@ -207,7 +215,7 @@ Produce the sample package folder:
 dotnet publish src/Runner.SamplePlugin -c Release -o artifacts/sample-package
 ```
 
-Upload that output folder from the dashboard and select `Runner.SamplePlugin.dll`; its entry type is `Runner.SamplePlugin.EchoPlugin`. Supply dependent DLLs, `.deps.json`, native runtime assets and resources as needed. Exclude `Runner.Contracts.dll`, which is shared with the host. Framework and `Microsoft.Extensions.*` dependencies must be compatible with the host; a package does not install a new .NET runtime or restore NuGet dependencies remotely. Managed dependency loading is checked at installation; native imports and business behavior are validated when the plugin runs. Deploy native dependencies for the worker OS, and use compatible/homogeneous worker pools for platform-specific packages; automatic OS/capability routing is not implemented.
+Upload that output folder from the dashboard and select `Runner.SamplePlugin.dll`; its entry type is `Runner.SamplePlugin.EchoPlugin`. Supply dependent DLLs, `.deps.json`, native runtime assets and resources as needed. Exclude `Runner.Contracts.dll`, which is shared with the host. Framework and `Microsoft.Extensions.*` dependencies must be compatible with the host; a package does not install a new .NET runtime or restore NuGet dependencies remotely. Managed dependency loading is checked at installation; native imports and business behavior are validated when the plugin runs. Deploy native dependencies for the worker OS and declare OS/architecture/resource/tag requirements in runner.manifest.json so compatible nodes are selected before claiming; see [placement](docs/platform.md#2-manifest-and-placement).
 
 ### Version and lifecycle behavior
 
@@ -241,7 +249,7 @@ Use the same wrapper payload with `/api/schedules`. Specify a version when repla
 
 Uploads accept at most 512 files / 50 MiB, with a 64 MiB multipart request limit, and six install requests per minute per host. Paths must be relative and portable; traversal, symlinks, case-colliding file names, Windows reserved names and a bundled contract copy are rejected. There is no endpoint that executes an arbitrary server filesystem DLL path.
 
-Package metadata, execution policy and bytes are shared through the job database; API and worker replicas do not need a shared source folder. Every execution verifies the stored archive digest, materializes a unique local working directory, and uses a collectible assembly load context. Configure a writable `Packages__CacheDirectory` (default `data/package-cache`) on each worker. Entry instances are disposed when supported. Unload and directory deletion are best effort: native code, static references, or background threads can retain mappings; Windows may retain DLL files until collection or process exit. Clean stale working directories while workers are stopped. Large archives incur database transfer and extraction costs on each execution; benchmark your package sizes and concurrency before production. There is no automatic restart or service registration.
+Package metadata, execution policy and bytes are shared through the job database; API and worker replicas do not need a shared source folder. Every execution verifies the stored archive digest, materializes a unique local working directory, and uses a collectible assembly load context. Configure a writable `Packages__CacheDirectory` (default `data/package-cache`) on each worker. Entry instances are disposed when supported. Unload and directory deletion are best effort: native code, static references, or background threads can retain mappings; Windows may retain DLL files until collection or process exit. Clean stale working directories while workers are stopped. Large archives incur a DB transfer on a cold local cache and extraction/hash costs per execution. Warm runs reuse a verified digest-addressed local ZIP. Benchmark package sizes/concurrency and set cache disk quotas; automatic archive eviction is not implemented. There is no automatic restart or service registration. Process-mode child execution prevents a package crash from exiting the parent worker; it does not change at-least-once delivery or OS permissions.
 
 Only trusted operators may install reviewed packages. Plugin code has the host process's privileges and can access its resources. Interface validation and a digest are compatibility/integrity checks, not publisher authentication or a sandbox. Constructor/entry code, native imports, and background threads remain the author's responsibility. SHA-256 does not protect against a database administrator replacing both archive and digest. Keep the cache directory restricted to the worker identity; symlink/reparse-point cache ancestors are rejected. Use a separate constrained process/container for untrusted plugins.
 
@@ -250,7 +258,7 @@ Set `Packages__Enabled=false` to disable package APIs/execution on a host; keep 
 Existing databases need the explicit version 5 upgrade, with workers stopped and a backup available:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-concurrency
+dotnet Runner.Host.dll --upgrade-platform
 ```
 
 It applies earlier upgrades as needed, adds package versions/channels/history and nullable package references on jobs/schedules, and is safe to rerun. Fresh database bootstrap includes the tables; `scripts/dev.sh` handles the upgrade locally.
@@ -397,7 +405,7 @@ Delivery uses a leased DB outbox across replicas, a 10-second request timeout, e
 Existing databases must be backed up and upgraded with workers stopped:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-concurrency
+dotnet Runner.Host.dll --upgrade-platform
 ```
 
 This applies the version 2 functions, version 3 attempt/log/alert tables and version 4 package management tables when needed, preserves existing jobs/functions, and records applied versions. It is safe to rerun. Fresh databases include the new tables; the development script handles bootstrap/upgrade. Use a separate DDL deployment identity, then run with a restricted DML identity.
@@ -410,7 +418,7 @@ Enable scripting explicitly on **all** participating API and worker instances:
 Scripting__Enabled=true bash scripts/dev.sh
 ```
 
-The development script initializes a fresh database or applies the version 2/3/4/5 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
+The development script initializes a fresh database or applies the version 2/3/4/5/6 upgrades to an existing local database. Production upgrades are explicit; follow the upgrade instructions below.
 
 Use **C# function registry** in the dashboard to compile and register a named version, inspect compilation diagnostics, select the registered version, supply JSON arguments, and queue a run. Use **Details** in job activity to inspect the persisted JSON result. The registry supports pagination, viewing source, and enabling or disabling versions.
 
@@ -462,7 +470,7 @@ return new { total = quantity * 7, jobId = JobId, attempt = Attempt };
 
 Successful output is serialized into `resultJson`, limited to 64 KiB, and committed with the same token/expiry checks as job completion. Failed attempts discard their result. The dashboard displays the parsed result. Serialization errors, runtime exceptions, and excessive output follow normal retry rules. Avoid returning secrets or sensitive objects; results are persisted in the database and accessible to operators.
 
-**Trust model:** Roslyn executes code inside the worker process with its filesystem, network, environment, and database access. This is not a sandbox. Only trusted operators should register reviewed code, and database write access must be restricted. API source immutability and hashes support version consistency; they do not defend against a database administrator who rewrites both source and hash. Cancellation is cooperative and cannot terminate an infinite loop that ignores the token. Use a separate constrained process/container for untrusted code or hard CPU/memory/time limits. Compilation delegates are cached by source hash with 32 entries; evicting a delegate does not unload generated assemblies, so recycle workers periodically if many distinct versions execute. Native AOT and trimmed deployments are not supported for this scripting host.
+**Trust model:** only trusted administrators should register reviewed source. Roslyn functions execute in a separate child process by default, with named business resources passed privately and parent-managed logs/results. Timeout or lease loss requests cancellation and then terminates an unresponsive child; the parent remains alive. Execution__Isolation=InProcess restores cooperative host execution for compatibility. Neither mode is a security sandbox: process children retain the OS identity's filesystem/network access. Use distinct constrained OS/container identities for untrusted code. Source immutability/hashes do not defend against a DB administrator rewriting both. Process mode recompiles in each short-lived executor; in-process delegates use a bounded 32-entry cache but generated assemblies can remain loaded. Native AOT and trimmed deployments are not supported.
 
 Scripting is disabled by default. While disabled, the registry endpoints return 404 and `runner.script` is not advertised as a handler. Keep the feature setting consistent across replicas, and drain script jobs before disabling it cluster-wide. Existing compiled DLL plugins remain available regardless of this setting.
 
@@ -490,6 +498,14 @@ All `/api/*` requests require an operator cookie or `X-Runner-Key`. Mutations al
 | GET / POST | `/api/functions` | List up to 50 function versions per page or compile and register one |
 | GET | `/api/functions/{id}` | Inspect an immutable function version and its source |
 | PATCH | `/api/functions/{id}` | Enable or disable a version with `{"enabled": false}` |
+| GET | `/api/session` | Current identity and roles |
+| GET | `/api/nodes` | Worker inventory, capabilities, status and drain progress |
+| POST | `/api/nodes/{id}/drain` | Admin: request drain/resume with a deadline |
+| GET / POST | `/api/workflows` | List runs or atomically register a dependency DAG |
+| GET | `/api/workflows/{id}` | Inspect pinned steps, results and dependencies |
+| GET | `/api/audit?page=0` | Admin: inspect attributable mutation intents/outcomes |
+| GET | `/api/diagnostics/database` | Process-local EF command counters without a DB query |
+| GET | `/api/packages/{id}/versions/{version}/placement` | Manifest and per-node incompatibility reasons |
 | GET | `/api/handlers` | List loaded job types |
 | GET | `/api/stats` | Count retained jobs by state |
 | GET | `/api/jobs?page=0&state=Running` | List up to 50 jobs; maximum page index is 10000 |
@@ -527,16 +543,25 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 | `Storage__Provider` | `Sqlite`, `Postgres` or `Mssql` |
 | `Storage__ConnectionString` | Local SQLite; supply a PostgreSQL or SQL Server DSN through a secret manager in production |
 | `Storage__Initialize` | `false`; create the schema during development |
-| `Security__ApiKey` | Required, at least 32 characters; preferably 32 random bytes encoded as 64 hexadecimal characters |
+| `Security__ApiKey` | Bootstrap administrator key; required unless OIDC/named keys provide access; at least 32 characters; preferably 32 random bytes encoded as 64 hexadecimal characters |
 | `Security__KeyDirectory` | Cookie data protection key directory; use a persistent volume with restricted access |
 | `Security__TrustedProxy` | Optional single reverse proxy IP; forwarded protocol and client IP headers are accepted only from this address |
 | `AllowedHosts` | `localhost;127.0.0.1`; explicitly add the production hostname |
 | `Runner__InstanceName` | Optional readable node name; a unique worker suffix is added per process |
 | `Runner__Concurrency` | 4, allowed range 1–128 |
-| `Runner__PollMilliseconds` | 1000, minimum 100 |
+| `Runner__PollMilliseconds` | 1000, minimum 100; adaptive idle delay starts here |
+| `Runner__MaxIdlePollSeconds` | 30; cap on cross-node discovery latency while idle |
+| `Runner__NodeHeartbeatSeconds` | 10; shared node status and database clock sampling |
+| `Runner__SchedulerSeconds` | 5; leased scheduler/recovery cycle |
+| `Runner__MaintenanceSeconds` | 300; normal retention interval, faster bounded catch-up when needed |
+| `Runner__MaxPendingJobs` | 100000 outstanding pending/running/blocked jobs across the cluster |
+| `Runner__Queues__0`, `Runner__Tags__0` | Allowed queue names and deployment capability tags |
+| `Execution__Isolation` | Process; explicit InProcess compatibility mode |
+| `Security__SessionVersion` | 1; rotate across replicas to revoke previous cookies |
+| `Security__Oidc__Authority`, `ClientId` | Optional organization sign-in; see cluster operations |
 | `Runner__LeaseSeconds` | 60 |
 | `Runner__HeartbeatSeconds` | 15, at most one third of the lease duration |
-| `Runner__JobTimeoutSeconds` | 300, cooperative |
+| `Runner__JobTimeoutSeconds` | 300; process-mode DLL/scripts receive cancellation followed by termination |
 | `Runner__RetentionDays` | 14; deletes only succeeded and cancelled jobs |
 | `Runner__WorkerEnabled` | true |
 | `Telemetry__OtlpEnabled` | false; enable to export traces and metrics |
@@ -561,12 +586,12 @@ From the published application directory, bootstrap a new database/schema or app
 
 ```bash
 dotnet Runner.Host.dll --initialize
-dotnet Runner.Host.dll --upgrade-concurrency
+dotnet Runner.Host.dll --upgrade-platform
 ```
 
 Use the runtime identity with DML access afterward; configure `Security__ApiKey` and start the application as documented. Bootstrap may require database-creation permission; alternatively, have the DBA create an empty database and grant the deployment identity schema DDL access. The existing schema generation command, `dotnet Runner.Host.dll --schema`, emits SQL for the selected provider. SQL Server uses `dbo`, `datetime2(7)` for UTC timestamps, `varbinary(max)` for packages, and binary column collation (`Latin1_General_100_BIN2`) so case-sensitive version/idempotency semantics match the other providers. The unique idempotency index permits multiple null keys.
 
-MSSQL versions of upgrades 2, 3, 4 and 5 are included under `src/Runner.Engine/Migrations/`. Upgrades are explicit and repeatable with workers stopped and a backup available. Selecting a different storage provider points Runner at a different database; it does not transfer existing jobs or packages across providers. Plan and validate that data cutover separately. The supplied Compose preset still uses PostgreSQL; point a published host/container at your SQL Server using the settings above.
+MSSQL versions of upgrades 2, 3, 4, 5 and 6 are included under `src/Runner.Engine/Migrations/`. Upgrades are explicit and repeatable with workers stopped and a backup available. Selecting a different storage provider points Runner at a different database; it does not transfer existing jobs or packages across providers. Plan and validate that data cutover separately. The supplied Compose preset still uses PostgreSQL; point a published host/container at your SQL Server using the settings above.
 
 ## Cloud and on-premises deployment
 
@@ -580,15 +605,15 @@ docker compose up --build -d
 
 Compose runs one initialization job after PostgreSQL passes its health check, then starts Runner. PostgreSQL's port is not published to the host; Runner binds only to 127.0.0.1. In production, place a TLS reverse proxy in front of Runner and prevent direct access to the application container. Set `Security__TrustedProxy` to the actual proxy IP. Production cookies require HTTPS; browser login will not work over plain HTTP. You can use loopback HTTP with an API key for health and API smoke checks.
 
-For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3/4/5 upgrade from the published directory with the correct provider and connection string:
+For initial schema setup, run `dotnet Runner.Host.dll --schema` in the publish directory to generate SQL for the selected provider, then have a database operator apply the script. Alternatively, use `--initialize` in one controlled bootstrap process. `EnsureCreated` only bootstraps an empty database. For an existing database from the initial release, stop all workers, back up the database, and run the explicit version 2/3/4/5/6 upgrade from the published directory with the correct provider and connection string:
 
 ```bash
-dotnet Runner.Host.dll --upgrade-concurrency
+dotnet Runner.Host.dll --upgrade-platform
 ```
 
-The upgrade adds the function registry, nullable job result column, execution journal, alert outbox, and plugin package registry; it preserves existing jobs and schedules, records schema versions 2, 3, 4 and 5, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
+The upgrade adds the function registry, nullable job result column, execution journal, alert outbox, and plugin package registry; it preserves existing jobs and schedules, records schema versions 2, 3, 4, 5 and 6, and is safe to rerun. Its provider-specific SQL is versioned under `src/Runner.Engine/Migrations/`. Run the CLI once with a DDL-capable deployment role, validate readiness, then restart the hosts. The application does not upgrade production databases automatically. Rollback requires restoring the backup and previous application version; there is no destructive down-migration. Future schema changes require additional versioned upgrades and rollout plans. Restrict the runtime database role to DML permissions on the existing schema; use a separate DDL role for bootstrap. For PostgreSQL connections over untrusted networks, use `SSL Mode=VerifyFull` with the appropriate CA.
 
-Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating the API key does not immediately revoke existing eight-hour cookies: immediate session revocation requires cookie key ring rotation or an additional authentication revocation mechanism. Built-in authentication has a single operator role; multi-user RBAC and audit requirements need an OIDC gateway and centralized audit integration. Restrict access before exposing the service to the public internet.
+Before production, validate database backup and restore procedures, resource limits and load behavior, TLS, network policy, secret rotation, the telemetry collector, alert thresholds for queue age/dead-letter/lease loss, schema rollout, graceful draining, and plugin contract compatibility. Share cookie keys across replicas and manage encryption at rest through the platform or KMS. Rotating an API key does not revoke existing eight-hour cookies; rotate Security__SessionVersion consistently across replicas to reject old sessions on their next request. Built-in identity supports named Viewer/Operator/Admin keys, OIDC role mapping and durable audit intents/outcomes; configure organizational identity and protected audit export as described in [cluster operations](docs/platform.md). Restrict access before exposing the service to the public internet.
 
 ## Cost considerations
 

@@ -90,7 +90,7 @@ public sealed class ScriptCompiler : IDisposable
 }
 
 public sealed class ScriptFunctionHandler(IDbContextFactory<RunnerDb> factory, ScriptCompiler compiler,
-    IOptions<ScriptingOptions> options, DatabaseCommands? database = null, ApplicationCommands? applications = null) : IJobHandler
+    IOptions<ScriptingOptions> options, DatabaseCommands? database = null, ApplicationCommands? applications = null, IsolatedExecutor? executor = null) : IJobHandler
 {
     public const string JobType = "runner.script";
     public string Type => JobType;
@@ -106,6 +106,11 @@ public sealed class ScriptFunctionHandler(IDbContextFactory<RunnerDb> factory, S
             ?? throw new InvalidOperationException("Function version not found");
         if (!definition.Enabled) throw new InvalidOperationException("Function version is disabled");
         if (ScriptCompiler.Hash(definition.Source) != definition.SourceHash) throw new InvalidOperationException("Function source hash mismatch");
+        if (executor?.Enabled == true)
+        {
+            await executor.ExecuteAsync(context, null, null, definition.Source, ct);
+            return;
+        }
         var runner = compiler.Compile(definition.Source, ct);
         var result = await runner(new ScriptGlobals(context.JobId, context.Attempt, arguments, ct) { Db = database!, Apps = new FunctionApplications(applications!, context), Log = new FunctionLog(context) }, ct);
         ct.ThrowIfCancellationRequested();
