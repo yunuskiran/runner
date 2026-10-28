@@ -4,8 +4,8 @@ Validated in the onboarding Linux environment using .NET SDK 10.0.403:
 
 - Locked dependency restore: passed.
 - Release solution build: passed, zero warnings/errors.
-- Relational store tests: 58 passed with SQLite job storage, 58 passed with PostgreSQL 17 job storage; none skipped.
-- Business database provider integration: real PostgreSQL 17 and SQL Server 2022 Developer passed parameterized query/injection-literal, scalar/null, bounded results, execute, and timeout checks. Both live provider bindings were set; none of the 58 tests were skipped in the complete runs. Without bindings, the two external provider tests explicitly skip.
+- Relational store tests: 59 passed with SQLite job storage, 59 passed with PostgreSQL 17 job storage, 59 passed with SQL Server 2022 job storage; none skipped.
+- Business database provider integration: real PostgreSQL 17 and SQL Server 2022 Developer passed parameterized query/injection-literal, scalar/null, bounded results, execute, and timeout checks. Both live provider bindings were set; none of the 59 tests were skipped in the complete runs. Without bindings, the two external provider tests explicitly skip.
 - Process checks: literal arguments, bounded concurrent stdout/stderr draining, environment isolation, nonzero exit handling, timeout and cancellation passed on Linux. Native Windows executable execution has not been validated here.
 - Central journal/outbox tests: atomic failure/alert creation, expired final-attempt alert deduplication, delivery claim concurrency/fencing, bounded retries/parking, and repeatable version 3 upgrades passed on both job storage providers.
 - Operations smoke: ready database/process jobs, safe resource metadata, centralized business/process logs, attempt reports and CSV, incident acknowledgement, Roslyn Db/Log helpers, and a real local HTTP webhook receiver passed. The receiver rejected the first signed request with 500; the second request delivered the same alert ID with valid HMAC.
@@ -29,3 +29,12 @@ The cloud draft stores install_script, start_skill and the MCR domain addition. 
 - Chromium selected a folder outside the application tree and a separate set of DLL/dependency files, installed and ran two versions, disabled the package and rolled back live. Desktop/mobile layout and history views passed with no JavaScript errors; screenshots are in docs/images/package-*.png.
 - Existing plugin, script, ready operation, central logging/reporting and signed alert delivery smoke checks passed after the package changes on both stores. Schedule smoke assertions match the current run’s schedule idempotency key so older jobs in a reused test database cannot count as passing results.
 - No Windows Service/SCM integration was added. Native Windows execution, untrusted-code sandboxing, automatic worker OS routing, package publisher signatures, and package-load benchmarks are not validated or implemented by this feature.
+
+## SQL Server primary storage — 2026-10-28
+
+- SQL Server 2022 Developer passed all 59 tests with no skips, including job claim concurrency, leases, cancellation, retry/dead-letter, journal/outbox atomicity, package installation/activation/pinning, archive integrity and repeatable schema upgrades 2–4.
+- Fresh databases and upgrade SQL use dbo, datetime2(7), varbinary(max) and binary string collation. Nullable idempotency keys allow multiple nulls, and keys/prerelease versions differing by case remain distinct.
+- SQLite and PostgreSQL regression runs passed the same 59 tests each.
+- SQL Server package and full application smoke checks exercised live upload/rollback, scripts, database/process jobs, reporting/CSV, centralized logs and signed webhook retry. The published application was tested with SQL Server storage.
+- A provider cancellation edge case was addressed by checking cancellation and elapsed budget before returning database command results. Timeout integration checks now assert the database_timeout classification.
+- CI includes MSSQL primary storage test and smoke steps. Runner storage and business-command connection providers are configured independently. No cross-provider data migration is performed when selecting a different store.

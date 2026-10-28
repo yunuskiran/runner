@@ -57,9 +57,9 @@ builder.Services.AddOptions<RunnerOptions>().BindConfiguration("Runner").Validat
     "Invalid worker bounds: heartbeat must be at most one third of lease.").ValidateOnStart();
 var provider = builder.Configuration["Storage:Provider"] ?? "Sqlite";
 var connection = builder.Configuration["Storage:ConnectionString"] ?? throw new InvalidOperationException("Storage connection required");
-if (provider is not ("Sqlite" or "Postgres")) throw new InvalidOperationException("Unsupported storage provider");
+if (!RunnerStorage.IsSupported(provider)) throw new InvalidOperationException("Unsupported storage provider");
 if (provider == "Sqlite") Directory.CreateDirectory("data");
-builder.Services.AddDbContextFactory<RunnerDb>(o => { if (provider == "Postgres") o.UseNpgsql(connection); else o.UseSqlite(connection); });
+builder.Services.AddDbContextFactory<RunnerDb>(o => RunnerStorage.Configure(o, provider, connection));
 builder.Services.Configure<ScriptingOptions>(builder.Configuration.GetSection("Scripting"));
 builder.Services.AddSingleton<ScriptCompiler>();
 if (builder.Configuration.GetValue<bool>("Scripting:Enabled"))

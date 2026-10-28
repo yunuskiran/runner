@@ -26,6 +26,8 @@ with tempfile.TemporaryDirectory() as tmp:
                Security__ApiKey=key, Security__KeyDirectory=tmp+'/keys', Storage__Initialize='true',
                Storage__ConnectionString='Data Source='+tmp+'/jobs.db;Default Timeout=30', Runner__PollMilliseconds='100',
                Scripting__Enabled=os.environ.get('SMOKE_SCRIPTING', 'false'), Runner__LeaseSeconds='12', Runner__HeartbeatSeconds='2', Runner__Concurrency='2')
+    if os.environ.get('SMOKE_MSSQL') and os.environ.get('SMOKE_POSTGRES'):raise ValueError('Select one smoke storage provider')
+    if os.environ.get('SMOKE_MSSQL'):env.update(Storage__Provider='Mssql',Storage__ConnectionString=os.environ['SMOKE_MSSQL'])
     if os.environ.get('SMOKE_POSTGRES'):
         env.update(Storage__Provider='Postgres', Storage__ConnectionString=os.environ['SMOKE_POSTGRES'])
     if operations:

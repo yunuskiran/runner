@@ -185,6 +185,18 @@
           "SQLitePCLRaw.core": "2.1.13"
         }
       },
+      "Microsoft.EntityFrameworkCore.SqlServer": {
+        "type": "Transitive",
+        "resolved": "10.0.14",
+        "contentHash": "S3zuzJE5qcl4jjBwSI1x1WZp/GiwzBk1qlFjI77O1E/FZ0mtXNYRBDCfAY0x7nly2zZjM2U5XIkw7AD3DsSpEQ==",
+        "dependencies": {
+          "Microsoft.Data.SqlClient": "6.1.7",
+          "Microsoft.EntityFrameworkCore.Relational": "10.0.14",
+          "Microsoft.Extensions.Caching.Memory": "10.0.14",
+          "Microsoft.Extensions.Configuration.Abstractions": "10.0.14",
+          "Microsoft.Extensions.Logging": "10.0.14"
+        }
+      },
       "Microsoft.Extensions.Caching.Abstractions": {
         "type": "Transitive",
         "resolved": "10.0.14",
@@ -465,6 +477,7 @@
         "dependencies": {
           "Microsoft.CodeAnalysis.CSharp.Scripting": "[5.9.0, )",
           "Microsoft.Data.SqlClient": "[7.1.1, )",
+          "Microsoft.EntityFrameworkCore.SqlServer": "[10.0.14, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[10.0.14, )",
           "Npgsql.EntityFrameworkCore.PostgreSQL": "[10.0.3, )",
           "Runner.Contracts": "[1.0.0, )",

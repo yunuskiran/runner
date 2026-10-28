@@ -77,6 +77,11 @@ public sealed class RunnerDb(DbContextOptions<RunnerDb> options) : DbContext(opt
         b.Entity<Job>().Property(x => x.Type).HasMaxLength(120);
         b.Entity<Job>().Property(x => x.IdempotencyKey).HasMaxLength(160);
         b.Entity<Schedule>().HasIndex(x => new { x.Enabled, x.NextUtc });
+        if (Database.IsSqlServer()) b.HasDefaultSchema("dbo");
+        if (Database.IsSqlServer())
+            foreach (var entity in b.Model.GetEntityTypes())
+                foreach (var property in entity.GetProperties().Where(p => p.ClrType == typeof(string)))
+                    property.SetCollation("Latin1_General_100_BIN2");
         foreach (var entity in b.Model.GetEntityTypes())
             foreach (var property in entity.GetProperties())
                 if (property.ClrType == typeof(DateTime) || property.ClrType == typeof(DateTime?))

@@ -84,18 +84,27 @@ public sealed class DatabaseCommands(IOptions<OperationOptions> options)
                 command.Parameters.Add(p);
             }
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(request.TimeoutSeconds));
+        var budget = TimeSpan.FromSeconds(request.TimeoutSeconds);
+        timeout.CancelAfter(budget);
+        var elapsed = Stopwatch.StartNew();
+        DatabaseResult Finish(DatabaseResult result)
+        {
+            ct.ThrowIfCancellationRequested();
+            timeout.Token.ThrowIfCancellationRequested();
+            if (elapsed.Elapsed >= budget) throw new JobExecutionException("database_timeout");
+            return result;
+        }
         try
         {
             await connection.OpenAsync(timeout.Token);
-            if (request.Mode == "execute") return new(await command.ExecuteNonQueryAsync(timeout.Token), null, null, false);
-            if (request.Mode == "scalar") return new(null, CleanValue(await command.ExecuteScalarAsync(timeout.Token)), null, false);
+            if (request.Mode == "execute") return Finish(new(await command.ExecuteNonQueryAsync(timeout.Token), null, null, false));
+            if (request.Mode == "scalar") return Finish(new(null, CleanValue(await command.ExecuteScalarAsync(timeout.Token)), null, false));
             await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleResult, timeout.Token);
             var rows = new List<Dictionary<string, object?>>();
             var bytes = 0;
             while (await reader.ReadAsync(timeout.Token))
             {
-                if (rows.Count == request.MaxRows) return new(null, null, rows, true);
+                if (rows.Count == request.MaxRows) return Finish(new(null, null, rows, true));
                 var row = new Dictionary<string, object?>();
                 for (int i = 0; i < reader.FieldCount; i++)
                 {
@@ -104,13 +113,15 @@ public sealed class DatabaseCommands(IOptions<OperationOptions> options)
                     row[key] = CleanValue(reader.GetValue(i));
                 }
                 bytes += JsonSerializer.SerializeToUtf8Bytes(row).Length;
-                if (bytes > 48000) return new(null, null, rows, true);
+                if (bytes > 48000) return Finish(new(null, null, rows, true));
                 rows.Add(row);
             }
-            return new(null, null, rows, false);
+            return Finish(new(null, null, rows, false));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (OperationCanceledException) { throw new JobExecutionException("database_timeout"); }
+        catch (DbException) when (ct.IsCancellationRequested) { throw new OperationCanceledException(ct); }
+        catch (DbException) when (timeout.IsCancellationRequested || elapsed.Elapsed >= budget) { throw new JobExecutionException("database_timeout"); }
         catch (SqlException e) when (e.Number == -2) { throw new JobExecutionException("database_timeout"); }
         catch (NpgsqlException e) when (e.InnerException is TimeoutException) { throw new JobExecutionException("database_timeout"); }
         catch (DbException) { throw new JobExecutionException("database_command_failed"); }

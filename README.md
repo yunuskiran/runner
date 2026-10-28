@@ -51,7 +51,7 @@ The dashboard includes live state counters, handler selection, JSON payloads, de
 ```mermaid
 flowchart LR
     Operator[Dashboard / API client] --> Host[ASP.NET Core host]
-    Host --> DB[(PostgreSQL / local SQLite)]
+    Host --> DB[(PostgreSQL / SQL Server / local SQLite)]
     Worker[Bounded worker loops] -->|claim / heartbeat / fenced completion| DB
     Scheduler[Interval dispatcher] -->|atomic schedule advancement + job insert| DB
     Worker --> Plugin[Trusted IJobHandler plugins]
@@ -64,7 +64,7 @@ flowchart LR
 - `Runner.SamplePlugin`: a sample handler loaded from a separate DLL.
 - `Runner.Tests`: concurrency and recovery tests against real relational databases.
 
-Use SQLite for single-instance development. Use PostgreSQL for multiple replicas and cloud deployments. Do not share a SQLite file over NFS. The dashboard/API and worker run in the same executable; set `Runner__WorkerEnabled=false` to run only the control plane. There is no separate worker-only executable; restrict network access at the deployment level.
+Use SQLite for single-instance development. Use PostgreSQL or Microsoft SQL Server for multiple replicas and cloud deployments. Do not share a SQLite file over NFS. The dashboard/API and worker run in the same executable; set `Runner__WorkerEnabled=false` to run only the control plane. There is no separate worker-only executable; restrict network access at the deployment level.
 
 ## Execution guarantees
 
@@ -196,7 +196,7 @@ Use **Ready-to-run operations** in the dashboard to select a provider and named 
 
 ### Named database connections
 
-Runner's own job storage remains SQLite or PostgreSQL. External business database commands support **PostgreSQL** (`Postgres`) and **Microsoft SQL Server** (`Mssql`). Configure resources outside job payloads and function source:
+Runner's own job storage supports SQLite, PostgreSQL, and Microsoft SQL Server. External business database commands support **PostgreSQL** (`Postgres`) and **Microsoft SQL Server** (`Mssql`). Configure resources outside job payloads and function source:
 
 ```bash
 # Supply actual connection strings through your deployment's secret manager.
@@ -441,8 +441,8 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 | `Alerts__SigningKey` | Optional HMAC signing secret |
 | `Alerts__DeliveryEnabled` | true; disable outbound delivery while retaining the inbox |
 | `Scripting__Enabled` | `false`; opt in to trusted Roslyn execution on every worker/API instance |
-| `Storage__Provider` | `Sqlite` or `Postgres` |
-| `Storage__ConnectionString` | Local SQLite; supply a PostgreSQL DSN through a secret manager in production |
+| `Storage__Provider` | `Sqlite`, `Postgres` or `Mssql` |
+| `Storage__ConnectionString` | Local SQLite; supply a PostgreSQL or SQL Server DSN through a secret manager in production |
 | `Storage__Initialize` | `false`; create the schema during development |
 | `Security__ApiKey` | Required, at least 32 characters; preferably 32 random bytes encoded as 64 hexadecimal characters |
 | `Security__KeyDirectory` | Cookie data protection key directory; use a persistent volume with restricted access |
@@ -459,6 +459,30 @@ Configuration follows ASP.NET Core conventions: appsettings, environment variabl
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, using standard SDK configuration |
 
 The `Runner` ActivitySource and Meter expose `runner.jobs.finished` and `runner.jobs.duration`, alongside ASP.NET request and runtime metrics. `runner.jobs.finished` measures local execution completions rather than durable job counts. Log scopes include JobId, JobType, and Attempt. API error responses exclude exceptions and payloads. Plugin exceptions are logged; plugins must avoid logging secrets.
+
+## SQL Server as Runner storage
+
+SQL Server can store **jobs, schedules, function source, package archives/versions, execution logs, reports, and alert delivery state**. This is independent of `Operations__Connections`, which selects databases for business commands. SQL Server 2022 Developer was used for integration validation; use an appropriately licensed SQL Server edition or managed service for production.
+
+Configure the provider and inject the connection string securely:
+
+```bash
+export Storage__Provider=Mssql
+export Storage__ConnectionString="$RUNNER_SQLSERVER_CONNECTION_STRING"
+```
+
+A production connection string should use a trusted server certificate, for example `Server=sql.example.com,1433;Database=Runner;User ID=runner;Password=<secret>;Encrypt=True;TrustServerCertificate=False`. Supply the actual value through environment settings or your secret manager, rather than committing it. SQLite and PostgreSQL remain selectable with `Sqlite` and `Postgres`.
+
+From the published application directory, bootstrap a new database/schema or apply the explicit upgrades with a separate deployment identity:
+
+```bash
+dotnet Runner.Host.dll --initialize
+dotnet Runner.Host.dll --upgrade-packages
+```
+
+Use the runtime identity with DML access afterward; configure `Security__ApiKey` and start the application as documented. Bootstrap may require database-creation permission; alternatively, have the DBA create an empty database and grant the deployment identity schema DDL access. The existing schema generation command, `dotnet Runner.Host.dll --schema`, emits SQL for the selected provider. SQL Server uses `dbo`, `datetime2(7)` for UTC timestamps, `varbinary(max)` for packages, and binary column collation (`Latin1_General_100_BIN2`) so case-sensitive version/idempotency semantics match the other providers. The unique idempotency index permits multiple null keys.
+
+MSSQL versions of upgrades 2, 3 and 4 are included under `src/Runner.Engine/Migrations/`. Upgrades are explicit and repeatable with workers stopped and a backup available. Selecting a different storage provider points Runner at a different database; it does not transfer existing jobs or packages across providers. Plan and validate that data cutover separately. The supplied Compose preset still uses PostgreSQL; point a published host/container at your SQL Server using the settings above.
 
 ## Cloud and on-premises deployment
 
@@ -484,7 +508,7 @@ Before production, validate database backup and restore procedures, resource lim
 
 ## Cost considerations
 
-Start with a single machine and SQLite. For durable operation across multiple replicas, use PostgreSQL through an existing database, a small VM, or a suitable managed plan. A cache is optional. Redis or Azure cache eviction makes them unsuitable as the primary job store for this design. A DynamoDB adapter is not implemented; it would require separate storage and management layers supporting conditional writes, leases, schedule transactions, and indexed queries. Free tiers and Azure/AWS pricing depend on the account and region; free operation is not guaranteed.
+Start with a single machine and SQLite. For durable operation across multiple replicas, use PostgreSQL or SQL Server through an existing database, a small VM, or a suitable managed plan. A cache is optional. Redis or Azure cache eviction makes them unsuitable as the primary job store for this design. A DynamoDB adapter is not implemented; it would require separate storage and management layers supporting conditional writes, leases, schedule transactions, and indexed queries. Free tiers and Azure/AWS pricing depend on the account and region; free operation is not guaranteed.
 
 ## Validation
 
@@ -492,6 +516,8 @@ Start with a single machine and SQLite. For durable operation across multiple re
 dotnet test tests/Runner.Tests -c Release
 # This connection role needs CREATEDB to create and delete isolated test databases:
 TEST_POSTGRES='Host=localhost;Username=postgres;Password=...' dotnet test tests/Runner.Tests -c Release
+# SQL Server storage tests create/delete isolated databases; grant equivalent deployment permissions.
+TEST_MSSQL='Server=localhost,1433;User ID=sa;Password=...;Encrypt=False' dotnet test tests/Runner.Tests -c Release
 # Optional live business database checks (separate from Runner's own store):
 # TEST_DATABASE_POSTGRES and TEST_DATABASE_MSSQL select disposable PostgreSQL/SQL Server services.
 # With no bindings those two integration checks are explicitly skipped.
@@ -500,12 +526,15 @@ SMOKE_SCRIPTING=true SMOKE_OPERATIONS=true python3 scripts/smoke.py
 python3 scripts/package_smoke.py
 # Use an empty database dedicated to testing; the smoke test does not delete it automatically.
 SMOKE_POSTGRES='Host=localhost;Database=runner_smoke;Username=postgres;Password=...' python3 scripts/smoke.py
+# Plaintext is only for a disposable loopback development server; use certificate verification in production.
+SMOKE_MSSQL='Server=localhost,1433;Database=runner_smoke;User ID=sa;Password=...;Encrypt=False' python3 scripts/smoke.py
+SMOKE_MSSQL='Server=localhost,1433;Database=runner_package_smoke;User ID=sa;Password=...;Encrypt=False' python3 scripts/package_smoke.py
 dotnet publish src/Runner.Host -c Release -o artifacts/publish
 docker build -t runner:local .
 ```
 
 To regenerate the committed screenshots, start a local instance with scripting enabled and sample data, install Playwright separately from the application, and run `scripts/capture-dashboard.cjs`. It requires Chromium (default `/usr/bin/chromium`, override with `CHROMIUM_PATH`), `RUNNER_SCREENSHOT_URL` for the target instance, and a local operator key file (`RUNNER_KEY_FILE`, default `src/Runner.Host/data/operator.key`). The capture tool creates sample functions and jobs in that instance; use a disposable development database. It never renders or saves the operator key in an image.
 
-Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests both Runner storage providers and both business database command providers. SQL Server Developer is used only for development/testing, with test-only plaintext loopback connections; configure encryption and licensing appropriately for production. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.
+Store tests cover concurrent claims, lease takeover and fencing, rejection of expired completion updates, retries and dead-letter handling, crash recovery on the final attempt, cancellation, atomic schedule dispatch, retention, and unique idempotency keys. The smoke test launches a real host and exercises API authentication, antiforgery login, plugin loading and execution, retries, cancellation, and schedule dispatch. CI tests all three Runner storage providers and both business database command providers. SQL Server Developer is used only for development/testing, with test-only plaintext loopback connections; configure encryption and licensing appropriately for production. Additional tests cover Roslyn diagnostics, directive/source limits, cooperative script cancellation, disabled workers, pinned function execution, unique function versions, result fencing, and repeatable schema upgrades that preserve existing jobs.
 
-Package validation also exercises immutable uploads, entry contracts, archive integrity, activation revisions, pause/resume, version-pinned jobs/schedules, rollback/history, and repeatable version 4 upgrades. Run `scripts/package_smoke.py` with `SMOKE_POSTGRES` for PostgreSQL job storage. Optional `scripts/package_browser.cjs` uses Playwright/Chromium to select files and a folder outside the application tree, install and run two versions live, disable/roll back, and capture package manager screenshots. Use a disposable development instance and `RUNNER_SCREENSHOT_URL` / `RUNNER_KEY_FILE` as with the other capture tools.
+Package validation also exercises immutable uploads, entry contracts, archive integrity, activation revisions, pause/resume, version-pinned jobs/schedules, rollback/history, and repeatable version 4 upgrades. Run `scripts/package_smoke.py` with `SMOKE_POSTGRES` for PostgreSQL job storage or `SMOKE_MSSQL` for SQL Server job storage. Optional `scripts/package_browser.cjs` uses Playwright/Chromium to select files and a folder outside the application tree, install and run two versions live, disable/roll back, and capture package manager screenshots. Use a disposable development instance and `RUNNER_SCREENSHOT_URL` / `RUNNER_KEY_FILE` as with the other capture tools.

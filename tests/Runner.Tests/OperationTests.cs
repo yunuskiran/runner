@@ -40,8 +40,9 @@ public sealed class OperationTests
         Assert.True(result.Truncated); Assert.Equal(2, result.Rows!.Count);
         var execute = provider == "Postgres" ? "CREATE TEMP TABLE runner_execute (value int); INSERT INTO runner_execute VALUES (1)" : "CREATE TABLE #runner_execute (value int); INSERT INTO #runner_execute VALUES (1)";
         result = await db.RunAsync(new DatabaseRequest("test", execute), default); Assert.Equal(1, result.AffectedRows);
-        var wait = provider == "Postgres" ? "SELECT pg_sleep(5)" : "WAITFOR DELAY '00:00:05'";
-        await Assert.ThrowsAsync<JobExecutionException>(() => db.RunAsync(new DatabaseRequest("test", wait, TimeoutSeconds: 1), default));
+        var wait = provider == "Postgres" ? "SELECT pg_sleep(5)" : "WHILE 1 = 1 BEGIN WAITFOR DELAY '00:00:00.1'; END";
+        var timeout = await Assert.ThrowsAsync<JobExecutionException>(() => db.RunAsync(new DatabaseRequest("test", wait, TimeoutSeconds: 1), default));
+        Assert.Equal("database_timeout", timeout.Code);
     }
     [Fact] public async Task Unknown_connection_is_rejected_without_exposing_secrets()
     {

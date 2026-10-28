@@ -14,8 +14,15 @@ public sealed class StoreTests : IAsyncLifetime
     public async Task InitializeAsync()
     {
         var pg = Environment.GetEnvironmentVariable("TEST_POSTGRES");
+        var mssql = Environment.GetEnvironmentVariable("TEST_MSSQL");
+        if (pg is not null && mssql is not null) throw new InvalidOperationException("Select TEST_POSTGRES or TEST_MSSQL, not both");
         var options = new DbContextOptionsBuilder<RunnerDb>();
-        if (pg is null) options.UseSqlite($"Data Source={Path.GetTempPath()}runner-{Guid.NewGuid():N}.db;Default Timeout=30");
+        if (mssql is not null)
+        {
+            var cs = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(mssql) { InitialCatalog = $"runner_test_{Guid.NewGuid():N}" };
+            RunnerStorage.Configure(options, "Mssql", cs.ConnectionString);
+        }
+        else if (pg is null) options.UseSqlite($"Data Source={Path.GetTempPath()}runner-{Guid.NewGuid():N}.db;Default Timeout=30");
         else { var cs = new Npgsql.NpgsqlConnectionStringBuilder(pg) { Database = $"runner_test_{Guid.NewGuid():N}" }; options.UseNpgsql(cs.ConnectionString); }
         factory = new TestFactory(options.Options); store = new JobStore(factory);
         await using var db = factory.CreateDbContext(); await db.Database.EnsureCreatedAsync();
@@ -249,12 +256,24 @@ public sealed class StoreTests : IAsyncLifetime
         await db.Database.ExecuteSqlRawAsync("DROP TABLE \"PluginPackages\"; DROP TABLE \"PluginChannels\"; DROP TABLE \"PackageChanges\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Jobs\" DROP COLUMN \"PackageVersion\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageId\"; ALTER TABLE \"Schedules\" DROP COLUMN \"PackageVersion\";");
         await SchemaUpgrade.ApplyPackagesAsync(db); await SchemaUpgrade.ApplyPackagesAsync(db);
         Assert.Equal(job.Id, (await db.Jobs.SingleAsync()).Id); Assert.Empty(await db.PluginPackages.Select(x => x.PackageId).ToListAsync());
+        var packages = PackageService();
+        foreach (var version in new[] { "1.0.0-rc.1", "1.0.0-RC.1" })
+            await packages.InstallAsync("company.echo", version, "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
+        Assert.Equal(2, await db.PluginPackages.CountAsync());
     }
     [Fact] public async Task Corrupt_package_archive_is_rejected_at_execution()
     {
         var packages = PackageService(); await packages.InstallAsync("company.echo", "1.0.0", "Runner.SamplePlugin.dll", null, FixtureFiles(), default);
         await using (var db = factory.CreateDbContext()) await db.PluginPackages.ExecuteUpdateAsync(s => s.SetProperty(x => x.Archive, new byte[] { 1, 2, 3 }));
         await Assert.ThrowsAsync<PackageException>(() => packages.MaterializeAsync("company.echo", "1.0.0", default));
+    }
+    [Fact] public async Task Idempotency_keys_preserve_case_and_allow_multiple_nulls()
+    {
+        await using var db = factory.CreateDbContext();
+        db.Jobs.AddRange(new Job(), new Job(), new Job { IdempotencyKey = "Order-123" }, new Job { IdempotencyKey = "order-123" });
+        await db.SaveChangesAsync();
+        Assert.Equal(4, await db.Jobs.CountAsync());
+        Assert.Equal(1, await db.Jobs.CountAsync(x => x.IdempotencyKey == "Order-123"));
     }
     private sealed class TestFactory(DbContextOptions<RunnerDb> options) : IDbContextFactory<RunnerDb>
     { public RunnerDb CreateDbContext() => new(options); }

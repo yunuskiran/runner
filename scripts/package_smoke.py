@@ -9,6 +9,8 @@ with tempfile.TemporaryDirectory() as tmp:
     env=dict(os.environ,ASPNETCORE_ENVIRONMENT='Development',ASPNETCORE_URLS=base,Security__ApiKey=key,
         Security__KeyDirectory=tmp+'/keys',Storage__Initialize='true',Storage__Provider='Sqlite',Storage__ConnectionString='Data Source='+tmp+'/packages.db',
         Packages__CacheDirectory=tmp+'/package-cache',Runner__PollMilliseconds='100')
+    if os.environ.get('SMOKE_MSSQL') and os.environ.get('SMOKE_POSTGRES'):raise ValueError('Select one smoke storage provider')
+    if os.environ.get('SMOKE_MSSQL'):env.update(Storage__Provider='Mssql',Storage__ConnectionString=os.environ['SMOKE_MSSQL'])
     if os.environ.get('SMOKE_POSTGRES'):env.update(Storage__Provider='Postgres',Storage__ConnectionString=os.environ['SMOKE_POSTGRES'])
     host=pathlib.Path(os.environ.get('SMOKE_HOST_DLL',root/'src/Runner.Host/bin/Release/net10.0/Runner.Host.dll')).resolve()
     cwd=host.parent if 'SMOKE_HOST_DLL' in os.environ else root/'src/Runner.Host'
