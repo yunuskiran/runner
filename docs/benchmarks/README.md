@@ -74,4 +74,15 @@ python3 scripts/report-benchmarks.py artifacts/benchmarks/<run>.json \
 
 JSON is saved after each valid case under ignored `artifacts/benchmarks`. The renderer exports CSV/Markdown medians and an optional SVG; it refuses smoke reports or incompatible workload/timing combinations. Multiple repetitions are necessary to assess variance. A single local run is exploratory and cannot establish a universal winner or a production sizing target. No performance thresholds are asserted in CI: shared runners vary.
 
+For an explicit code optimization comparison, build each **committed** Runner revision separately and keep its binaries and raw reports. Run both with identical workload, timing, polling, lease and journal settings, alternate revision order, and keep other test/load activity stopped. The revision renderer requires at least three Runner samples on each side, preserves sample ranges, and rejects changed Runner effective settings, incompatible environments/workloads, incomplete matrices, repeated input paths and smoke data. It allows only the explicit Runner revision difference; the ordinary renderer above continues to reject mixed revisions.
+
+```bash
+python3 scripts/compare-benchmark-revisions.py \
+  --before artifacts/benchmarks/<before-run-1>.json artifacts/benchmarks/<before-run-2>.json artifacts/benchmarks/<before-run-3>.json \
+  --after artifacts/benchmarks/<after-run-1>.json artifacts/benchmarks/<after-run-2>.json artifacts/benchmarks/<after-run-3>.json \
+  --output artifacts/benchmarks/optimization --plot
+```
+
+Ranges are observed min–max, not confidence intervals. SQL request savings alone do not establish SQL CPU, logical IO, or latency improvements. Runner retains history/lease/placement/capacity controls, and a 30-second default idle cap still trades cross-node discovery latency for fewer polls. Select the responsive profile for the explicit one-second comparison rather than interpreting a polling configuration change as faster engine code.
+
 Only generated databases named `runner_bench_<GUID>` / `runner_bench_result_<GUID>` and the tool's generated XE sessions are created/dropped. The supplied connection's original database is not overwritten. Normal completion and handled failures stop workers and remove those resources. Forced process/machine termination can leave temporary resources; inspect the generated identifiers before manual cleanup. No scripts publish packages or contact a production service.

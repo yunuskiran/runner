@@ -47,13 +47,25 @@ public static class ExecutionJournal
     public static void AddAlert(RunnerDb db, Job job, DateTime now, string error) =>
         db.Alerts.Add(new JobAlert { Id = job.LeaseToken ?? job.Id, JobId = job.Id, JobType = job.Type,
             CreatedUtc = now, ErrorCode = error, NextDeliveryUtc = now });
-    public static async Task FinishAttemptAsync(RunnerDb db, Guid token, DateTime now, string outcome, string? error, CancellationToken ct)
+    public static Task FinishAttemptAsync(RunnerDb db, Guid token, DateTime now, string outcome, string? error, CancellationToken ct)
     {
-        var attempt = await db.Attempts.AsNoTracking().SingleOrDefaultAsync(x => x.Id == token, ct);
-        if (attempt is null) return;
-        await db.Attempts.Where(x => x.Id == token && x.Outcome == "Running")
-            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Outcome, outcome).SetProperty(x => x.ErrorCode, error)
-                .SetProperty(x => x.FinishedUtc, now).SetProperty(x => x.DurationMilliseconds, Math.Max(0, (now - attempt.StartedUtc).TotalMilliseconds)), ct);
+        // Calculate against the durable start time in the same conditional write: no read round trip,
+        // no local elapsed-time guess, and no overflow for attempts recovered after a long outage.
+        if (db.Database.IsSqlServer()) return db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE [dbo].[Attempts] SET [Outcome]={outcome}, [ErrorCode]={error}, [FinishedUtc]={now},
+              [DurationMilliseconds]=CASE WHEN [StartedUtc]>{now} THEN 0 ELSE DATEDIFF_BIG(microsecond,[StartedUtc],{now})/1000.0 END
+            WHERE [Id]={token} AND [Outcome]='Running'
+            """, ct);
+        if (db.Database.IsNpgsql()) return db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE "Attempts" SET "Outcome"={outcome}, "ErrorCode"={error}, "FinishedUtc"={now},
+              "DurationMilliseconds"=GREATEST(0,EXTRACT(EPOCH FROM ({now}-"StartedUtc"))*1000)
+            WHERE "Id"={token} AND "Outcome"='Running'
+            """, ct);
+        return db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE "Attempts" SET "Outcome"={outcome}, "ErrorCode"={error}, "FinishedUtc"={now},
+              "DurationMilliseconds"=MAX(0,(julianday({now})-julianday("StartedUtc"))*86400000)
+            WHERE "Id"={token} AND "Outcome"='Running'
+            """, ct);
     }
 }
 

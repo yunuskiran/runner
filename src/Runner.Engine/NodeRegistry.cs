@@ -21,7 +21,13 @@ public sealed class NodeRegistry(IDbContextFactory<RunnerDb> factory, IOptions<R
     {
         if (clock is not null) { await clock.SynchronizeAsync(ct); now = clock.UtcNow; }
         await using var db = await factory.CreateDbContextAsync(ct);
-        var node = await db.WorkerNodes.AsNoTracking().SingleOrDefaultAsync(x => x.Id == Id, ct);
+        // Read drain state and the small package-registry marker in one request per heartbeat.
+        var snapshot = await (from marker in db.ClusterLeases.AsNoTracking()
+            where marker.Name == "packages"
+            join worker in db.WorkerNodes on Id equals worker.Id into workers
+            from nodeRow in workers.DefaultIfEmpty()
+            select new { marker.Owner, Node = nodeRow }).SingleAsync(ct);
+        var node = snapshot.Node;
         if (node is null)
         {
             db.WorkerNodes.Add(new WorkerNode { Id = Id, Name = options.Value.InstanceName ?? Environment.MachineName,
@@ -36,13 +42,18 @@ public sealed class NodeRegistry(IDbContextFactory<RunnerDb> factory, IOptions<R
             await db.WorkerNodes.Where(x => x.Id == Id).ExecuteUpdateAsync(s => s.SetProperty(x => x.HeartbeatUtc, now)
                 .SetProperty(x => x.ActiveJobs, active).SetProperty(x => x.DrainAcknowledgedUtc, Draining ? now : (DateTime?)null), ct);
         }
-        await RefreshPackagesAsync(ct);
+        await RefreshPackagesAsync(db, snapshot.Owner, ct);
     }
 
     public async Task RefreshPackagesAsync(CancellationToken ct)
     {
         await using var db = await factory.CreateDbContextAsync(ct);
         var stamp = await db.ClusterLeases.Where(x => x.Name == "packages").Select(x => x.Owner).SingleAsync(ct);
+        await RefreshPackagesAsync(db, stamp, ct);
+    }
+
+    private async Task RefreshPackagesAsync(RunnerDb db, string? stamp, CancellationToken ct)
+    {
         if (packagesLoaded && stamp == refreshedStamp) return;
         var versions = await db.PluginPackages.AsNoTracking().OrderBy(x => x.PackageId).ThenBy(x => x.Version)
             .Select(x => new { x.PackageId, x.Version, x.ManifestJson }).Take(10001).ToListAsync(ct);

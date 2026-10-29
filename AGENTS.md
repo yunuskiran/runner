@@ -34,3 +34,5 @@ This cloud task already has an isolated checkout. Use this checkout; do not crea
 - Workflow dependencies must survive retention and manual retry; calendar changes need DST/misfire coverage. scripts/load_smoke.py measures idle command rate separately from job throughput; never claim local measurements certify production capacity.
 
 - Comparative benchmarks live outside Runner.sln in tools/Runner.Benchmarks; keep Hangfire/Quartz out of production dependencies. Use real persistent SQL stores, equal in-process bodies/node counts, server-side filtered metrics, separate result/observer traffic and explicit configuration profiles. Smoke checks are functional checks, not performance evidence; do not assert a universal winner from local measurements.
+
+- Dispatch windows share candidate reads only: recheck SQL eligibility and snapshot attempt/state/token for every lease, commit each journal before yielding, cap body reads by free slots, and stop mid-window after local heartbeat failure. Preserve the background-probe next-cycle fallback; polling settings must stay explicit in before/after benchmarks.

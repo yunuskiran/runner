@@ -62,9 +62,10 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
                 }
                 if (leader)
                 {
-                    var dispatched = await store.DispatchSchedulesAsync(now, ct);
-                    dispatched += await workflows.AdvanceAsync(now, ct);
-                    await store.RecoverAsync(now, ct);
+                    var work = await store.BackgroundWorkAsync(now, ct);
+                    var dispatched = work.Schedules ? await store.DispatchSchedulesAsync(now, ct) : 0;
+                    if (work.Workflows) dispatched += await workflows.AdvanceAsync(now, ct);
+                    if (work.Recovery) await store.RecoverAsync(now, ct);
                     if (dispatched > 0) signals.Pulse();
                     if (now >= maintenance)
                     {
@@ -93,8 +94,13 @@ public sealed class Worker(IServiceScopeFactory scopes, JobStore store, HandlerC
                 { await signals.WaitAsync(TimeSpan.FromSeconds(1), ct); continue; }
                 try
                 {
-                    var job = await store.ClaimForNodeAsync(nodes, nodes.UtcNow, TimeSpan.FromSeconds(config.LeaseSeconds), ct);
-                    if (job is not null) { backoff.Reset(); tasks.Add(RunTracked(job, ct)); continue; }
+                    var claimed = false;
+                    await foreach (var job in store.ClaimAvailableForNodeAsync(nodes, config.Concurrency - tasks.Count, TimeSpan.FromSeconds(config.LeaseSeconds), ct))
+                    {
+                        claimed = true;
+                        tasks.Add(RunTracked(job, ct));
+                    }
+                    if (claimed) { backoff.Reset(); continue; }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                 catch (Exception e) { log.LogError(e, "Worker cycle failed"); }

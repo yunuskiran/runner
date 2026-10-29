@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Runner.Contracts;
 using Microsoft.Extensions.Options;
 using Runner.Engine.Packaging;
+using System.Runtime.CompilerServices;
 namespace Runner.Engine;
 
 public interface IJobStore
@@ -22,6 +23,25 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory, IOptions<Packa
     public Task<Job?> ClaimForNodeAsync(NodeRegistry node, DateTime now, TimeSpan lease, CancellationToken ct) =>
         ClaimCoreAsync(node.Id, now, lease, node.Capabilities, node.CompatiblePackages, false, ct);
 
+    /// <summary>Shares a bounded candidate read across free slots; each lease commits independently before yielding.</summary>
+    public IAsyncEnumerable<Job> ClaimAvailableForNodeAsync(NodeRegistry node, int capacity, TimeSpan lease, CancellationToken ct) =>
+        ClaimWindowAsync(node.Id, () => node.UtcNow, lease, node.Capabilities, node.CompatiblePackages, false, capacity, ct, () => !node.Draining);
+
+    public sealed record BackgroundWork(bool Schedules, bool Workflows, bool Recovery);
+
+    /// <summary>One indexed existence probe replaces four empty background scans per scheduler cycle.</summary>
+    public async Task<BackgroundWork> BackgroundWorkAsync(DateTime now, CancellationToken ct)
+    {
+        await using var db = await factory.CreateDbContextAsync(ct);
+        return await db.ClusterLeases.Where(x => x.Name == "scheduler").Select(_ => new BackgroundWork(
+            db.Schedules.Any(x => x.Enabled && x.NextUtc <= now),
+            db.Jobs.Any(x => x.State == JobState.Blocked && !x.CancellationRequested),
+            db.Jobs.Any(x => x.State == JobState.Running && x.LeaseUntilUtc <= now &&
+                (x.CancellationRequested || x.Attempts >= x.MaxAttempts)) ||
+            db.Jobs.Any(x => x.CancellationRequested && (x.State == JobState.Pending || x.State == JobState.Blocked))))
+            .SingleAsync(ct);
+    }
+
     private IQueryable<Job> Eligible(RunnerDb db, DateTime now, NodeCapabilities? capabilities, string[] compatible, string worker) =>
         db.Jobs.AsNoTracking().Where(x => !x.CancellationRequested && x.Attempts < x.MaxAttempts &&
             (capabilities == null || (db.WorkerNodes.Any(n => n.Id == worker && !n.DrainRequested) && capabilities.Handlers.Contains(x.Type) && capabilities.Queues.Contains(x.Queue) &&
@@ -34,46 +54,84 @@ public sealed class JobStore(IDbContextFactory<RunnerDb> factory, IOptions<Packa
     private async Task<Job?> ClaimCoreAsync(string worker, DateTime now, TimeSpan lease, NodeCapabilities? capabilities,
         string[] compatible, bool finalize, CancellationToken ct)
     {
+        await foreach (var job in ClaimWindowAsync(worker, () => now, lease, capabilities, compatible, finalize, 1, ct)) return job;
+        return null;
+    }
+
+    private async IAsyncEnumerable<Job> ClaimWindowAsync(string worker, Func<DateTime> clockNow, TimeSpan lease, NodeCapabilities? capabilities,
+        string[] compatible, bool finalize, int capacity, [EnumeratorCancellation] CancellationToken ct, Func<bool>? mayClaim = null)
+    {
+        if (capacity is < 1 or > 128) throw new ArgumentOutOfRangeException(nameof(capacity));
+        var now = clockNow();
         await using var db = await factory.CreateDbContextAsync(ct);
         if (finalize) await FinalizeExpiredAsync(db, now, false, ct);
         var ids = await Eligible(db, now, capabilities, compatible, worker).OrderBy(x => x.PriorityUtc).ThenBy(x => x.CreatedUtc).ThenBy(x => x.Id)
-            .Select(x => new { x.Id, x.PackageId }).Take(64).ToListAsync(ct);
-        var blockedPackages = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var candidate in ids)
+            .Select(x => x.Id).Take(64).ToListAsync(ct);
+        if (ids.Count == 0) yield break;
+        // Reuse one pooled connection only while filling this bounded window, never during idle waits.
+        await db.Database.OpenConnectionAsync(ct);
+        try
         {
-            if (candidate.PackageId is { } blockedId && blockedPackages.Contains(blockedId)) continue;
-            await using var transaction = await db.Database.BeginTransactionAsync(ct);
-            var id = candidate.Id;
-            PluginChannel? channel = null;
-            if (candidate.PackageId is { } packageId)
+            var bodies = new Dictionary<Guid, Job>();
+            var blockedPackages = new HashSet<string>(StringComparer.Ordinal);
+            var claimed = 0;
+            for (var index = 0; index < ids.Count; index++)
             {
-                if (await PackageConcurrency.LockAsync(db, packageId, ct) == 0) continue;
-                channel = await db.PluginChannels.AsNoTracking().SingleAsync(x => x.PackageId == packageId, ct);
-                if (!channel.Enabled || (channel.ExecutionMode == PluginExecutionMode.Sequential && channel.ExecutionLeaseUtc > now) ||
-                    (channel.MaxConcurrency is { } limit && await db.Jobs.CountAsync(x => x.PackageId == packageId && x.State == JobState.Running && x.LeaseUntilUtc > now, ct) >= limit))
-                { blockedPackages.Add(packageId); continue; }
+                ct.ThrowIfCancellationRequested();
+                if (mayClaim?.Invoke() == false) yield break;
+                if (bodies.Count == 0)
+                {
+                    // Fetch bodies only for currently free slots (at most eight per read), not all
+                    // 64 contention candidates. Large payloads must not scale with the search window.
+                    var batch = ids.Skip(index).Take(Math.Min(8, capacity - claimed)).ToArray();
+                    bodies = await db.Jobs.AsNoTracking().Where(x => batch.Contains(x.Id)).ToDictionaryAsync(x => x.Id, ct);
+                }
+                if (!bodies.Remove(ids[index], out var candidate)) continue;
+                now = clockNow();
+                if (candidate.PackageId is { } blockedId && blockedPackages.Contains(blockedId)) continue;
+                await using var transaction = await db.Database.BeginTransactionAsync(ct);
+                var id = candidate.Id;
+                PluginChannel? channel = null;
+                if (candidate.PackageId is { } packageId)
+                {
+                    if (await PackageConcurrency.LockAsync(db, packageId, ct) == 0) continue;
+                    channel = await db.PluginChannels.AsNoTracking().SingleAsync(x => x.PackageId == packageId, ct);
+                    if (!channel.Enabled || (channel.ExecutionMode == PluginExecutionMode.Sequential && channel.ExecutionLeaseUtc > now) ||
+                        (channel.MaxConcurrency is { } limit && await db.Jobs.CountAsync(x => x.PackageId == packageId && x.State == JobState.Running && x.LeaseUntilUtc > now, ct) >= limit))
+                    { blockedPackages.Add(packageId); continue; }
+                }
+                var token = Guid.NewGuid();
+                if (mayClaim?.Invoke() == false) yield break;
+                now = clockNow(); // A contended channel lock must not consume the new job's lease budget.
+                // The snapshot is only a hint. Recheck all placement/policy/ownership predicates in SQL,
+                // including its attempt/state/token, before using the immutable job body from that read.
+                var count = await Eligible(db, now, capabilities, compatible, worker).Where(x => x.Id == id &&
+                        x.Attempts == candidate.Attempts && x.State == candidate.State && x.LeaseToken == candidate.LeaseToken)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.State, JobState.Running)
+                        .SetProperty(x => x.LeaseToken, token).SetProperty(x => x.LeaseUntilUtc, now + lease)
+                        .SetProperty(x => x.ResultJson, (string?)null).SetProperty(x => x.Worker, worker).SetProperty(x => x.Attempts, x => x.Attempts + 1), ct);
+                if (count == 1)
+                {
+                    if (channel?.ExecutionMode == PluginExecutionMode.Sequential)
+                        await db.PluginChannels.Where(x => x.PackageId == candidate.PackageId)
+                            .ExecuteUpdateAsync(s => s.SetProperty(x => x.ExecutionToken, token).SetProperty(x => x.ExecutionLeaseUtc, now + lease), ct);
+                    var job = candidate;
+                    if (job.State == JobState.Running && job.LeaseToken is { } abandoned)
+                        await ExecutionJournal.FinishAttemptAsync(db, abandoned, now, "LeaseExpired", "lease_expired", ct);
+                    job.State = JobState.Running; job.LeaseToken = token; job.LeaseUntilUtc = now + lease;
+                    job.ResultJson = null; job.Worker = worker; job.Attempts++;
+                    db.Attempts.Add(new ExecutionAttempt { Id = token, JobId = id, JobType = job.Type, Attempt = job.Attempts, Worker = worker, StartedUtc = now });
+                    ExecutionJournal.AddLog(db, job, "Execution started", now);
+                    await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
+                    db.ChangeTracker.Clear();
+                    yield return job;
+                    if (++claimed >= capacity) yield break;
+                    continue;
+                }
+                await transaction.RollbackAsync(ct);
             }
-            var token = Guid.NewGuid();
-            var count = await Eligible(db, now, capabilities, compatible, worker).Where(x => x.Id == id)
-                .ExecuteUpdateAsync(s => s.SetProperty(x => x.State, JobState.Running)
-                    .SetProperty(x => x.LeaseToken, token).SetProperty(x => x.LeaseUntilUtc, now + lease)
-                    .SetProperty(x => x.ResultJson, (string?)null).SetProperty(x => x.Worker, worker).SetProperty(x => x.Attempts, x => x.Attempts + 1), ct);
-            if (count == 1)
-            {
-                if (channel?.ExecutionMode == PluginExecutionMode.Sequential)
-                    await db.PluginChannels.Where(x => x.PackageId == candidate.PackageId)
-                        .ExecuteUpdateAsync(s => s.SetProperty(x => x.ExecutionToken, token).SetProperty(x => x.ExecutionLeaseUtc, now + lease), ct);
-                var job = await db.Jobs.AsNoTracking().SingleAsync(x => x.Id == id, ct);
-                var abandoned = await db.Attempts.AsNoTracking().Where(x => x.JobId == id && x.Outcome == "Running").Select(x => x.Id).ToListAsync(ct);
-                foreach (var old in abandoned) await ExecutionJournal.FinishAttemptAsync(db, old, now, "LeaseExpired", "lease_expired", ct);
-                db.Attempts.Add(new ExecutionAttempt { Id = token, JobId = id, JobType = job.Type, Attempt = job.Attempts, Worker = worker, StartedUtc = now });
-                ExecutionJournal.AddLog(db, job, "Execution started", now);
-                await db.SaveChangesAsync(ct); await transaction.CommitAsync(ct);
-                return job;
-            }
-            await transaction.RollbackAsync(ct);
         }
-        return null;
+        finally { await db.Database.CloseConnectionAsync(); }
     }
 
     public async Task<bool> RenewAsync(Guid id, Guid token, DateTime now, TimeSpan lease, CancellationToken ct)
