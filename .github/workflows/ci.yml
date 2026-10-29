@@ -109,6 +109,11 @@ jobs:
           RECOVERY_PROVIDER: Mssql
           RECOVERY_CONNECTION: Server=localhost,1433;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
           RECOVERY_CONTAINER: ${{ job.services.mssql.id }}
+      - run: dotnet restore tools/Runner.Benchmarks --locked-mode
+      - run: dotnet build tools/Runner.Benchmarks -c Release --no-restore
+      - run: bash scripts/compare-benchmarks.sh --smoke
+        env:
+          BENCH_MSSQL: Server=localhost,1433;User ID=sa;Password=Runner-Test-Only42!;Encrypt=False
       - run: dotnet publish src/Runner.Host -c Release --no-restore -o artifacts/publish
       - run: docker build -t runner:ci .
       - uses: actions/upload-artifact@v4
@@ -125,6 +130,7 @@ jobs:
           path: |
             artifacts/load-*.json
             artifacts/recovery-*.json
+            artifacts/benchmarks/*-smoke.json
             docs/images/worker-*.png
             docs/images/dependency-workflows.png
             docs/images/calendar-schedules.png
