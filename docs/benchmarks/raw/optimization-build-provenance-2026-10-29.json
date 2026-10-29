@@ -1,0 +1,10 @@
+{
+  "beforeWorkerRevision": "22873302283ffe4caf5f27dd213a7d9c4ebd05b3",
+  "beforeHarnessRevision": "5362ba0c0897a3734b13e8c4d633a573a8cb0c0b",
+  "afterRevision": "2d00787b6ea0463457be7d9bcd955a08eaa40aa4",
+  "engineAssemblySha256": {
+    "before": "45ef72df613e92e5b680b6267dffa6a4296a8c862db1f475765b6016b996df09",
+    "after": "a5b9e1aa5e9aeb59beebc4bfab550a68fc5de4d6052fb39b6cfc311d459e614f"
+  },
+  "note": "The preserved before worker reports platform commit 2287330; Engine/Contracts source is unchanged by benchmark commit 5362ba0. Both sides use the same benchmark adapter sources and pinned dependencies. Samples use responsive polling with identical effective settings."
+}

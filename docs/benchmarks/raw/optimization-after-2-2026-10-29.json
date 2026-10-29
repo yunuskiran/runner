@@ -1,0 +1,167 @@
+{
+  "config": {
+    "Jobs": 200,
+    "Nodes": 2,
+    "Workers": 8,
+    "DelayMs": 10,
+    "WarmupJobs": 20,
+    "SettleSeconds": 35,
+    "IdleSeconds": 30,
+    "Repetitions": 1,
+    "Profiles": "responsive",
+    "Engines": "hangfire,quartz,runner",
+    "Smoke": false
+  },
+  "purpose": "exploratory local benchmark; not a production sizing result",
+  "runtime": ".NET 10.0.14",
+  "os": "Debian GNU/Linux 13 (trixie)",
+  "logicalProcessors": 4,
+  "runnerRevision": "1.0.0\u002B2d00787b6ea0463457be7d9bcd955a08eaa40aa4",
+  "packages": {
+    "HangfireSqlServer": "1.8.25",
+    "Quartz": "4.6.2",
+    "MicrosoftDataSqlClient": "7.1.1",
+    "NewtonsoftJson": "13.0.4"
+  },
+  "methodology": "Separate processes, same SQL Server, fresh database per case, common in-process body \u002B separate result database. Extended Events event_counter counts completed RPC/batches (observer/result traffic excluded). Statement event classes reported separately; do not add to request counts. Physical IO includes database background writes. Business latency ends before result insert/framework finalization; throughput waits for durable framework drain. No HTTP/auth/audit/plugin-process overhead in any adapter.",
+  "results": [
+    {
+      "Engine": "hangfire",
+      "Profile": "responsive",
+      "Repetition": 1,
+      "EffectiveSettings": {
+        "queuePollSeconds": 1,
+        "slidingInvisibilitySeconds": 300,
+        "tryAutoDetectSchemaDependentOptions": true,
+        "disableGlobalLocks": true
+      },
+      "Idle": {
+        "Seconds": 30.0747192,
+        "CompletedRequests": 164,
+        "SqlStatementEvents": 8,
+        "SpStatementEvents": 362,
+        "PhysicalReadBytes": 0,
+        "PhysicalWrittenBytes": 8192,
+        "EndConnections": 14,
+        "EndActiveRequests": 0,
+        "WorkerCpuMs": 340,
+        "EndWorkerWorkingSetBytes": 227426304,
+        "CompletedRequestsPerSecond": 5.453084995054584
+      },
+      "Load": {
+        "Seconds": 1.917429,
+        "CompletedRequests": 5635,
+        "SqlStatementEvents": 0,
+        "SpStatementEvents": 12877,
+        "PhysicalReadBytes": 0,
+        "PhysicalWrittenBytes": 4042752,
+        "EndConnections": 17,
+        "EndActiveRequests": 0,
+        "WorkerCpuMs": 1770,
+        "EndWorkerWorkingSetBytes": 262262784,
+        "CompletedRequestsPerSecond": 2938.8311118690704
+      },
+      "EnqueueSeconds": 1.8254994,
+      "JobsPerSecond": 106.54411536341105,
+      "BusinessLatencyP50Ms": 700,
+      "BusinessLatencyP95Ms": 753.333,
+      "BusinessLatencyP99Ms": 753.334,
+      "Jobs": 200,
+      "DistinctExecutingNodes": 2,
+      "DuplicateBodies": 0
+    },
+    {
+      "Engine": "quartz",
+      "Profile": "responsive",
+      "Repetition": 1,
+      "EffectiveSettings": {
+        "idleWaitSeconds": 1,
+        "clustered": true,
+        "acquisitionBatch": 0,
+        "executionHistory": "Quartz default; optional execution history not enabled"
+      },
+      "Idle": {
+        "Seconds": 30.0409436,
+        "CompletedRequests": 320,
+        "SqlStatementEvents": 0,
+        "SpStatementEvents": 234,
+        "PhysicalReadBytes": 0,
+        "PhysicalWrittenBytes": 32768,
+        "EndConnections": 11,
+        "EndActiveRequests": 0,
+        "WorkerCpuMs": 600,
+        "EndWorkerWorkingSetBytes": 233177088,
+        "CompletedRequestsPerSecond": 10.65212878333156
+      },
+      "Load": {
+        "Seconds": 3.3772723,
+        "CompletedRequests": 5420,
+        "SqlStatementEvents": 0,
+        "SpStatementEvents": 4898,
+        "PhysicalReadBytes": 0,
+        "PhysicalWrittenBytes": 3960832,
+        "EndConnections": 17,
+        "EndActiveRequests": 0,
+        "WorkerCpuMs": 2750,
+        "EndWorkerWorkingSetBytes": 266141696,
+        "CompletedRequestsPerSecond": 1604.8454251083042
+      },
+      "EnqueueSeconds": 3.2980623,
+      "JobsPerSecond": 59.84215017154201,
+      "BusinessLatencyP50Ms": 750,
+      "BusinessLatencyP95Ms": 1236.667,
+      "BusinessLatencyP99Ms": 1316.667,
+      "Jobs": 200,
+      "DistinctExecutingNodes": 2,
+      "DuplicateBodies": 0
+    },
+    {
+      "Engine": "runner",
+      "Profile": "responsive",
+      "Repetition": 1,
+      "EffectiveSettings": {
+        "pollMinimumMs": 1000,
+        "idlePollCapSeconds": 1,
+        "jobHeartbeatSeconds": 15,
+        "nodeHeartbeatSeconds": 10,
+        "schedulerSeconds": 5,
+        "retentionSeconds": 300,
+        "execution": "in-process IJobHandler, regular Runner engine journal/leases; no HTTP/auth/audit or plugin-process fork"
+      },
+      "Idle": {
+        "Seconds": 30.0405916,
+        "CompletedRequests": 200,
+        "SqlStatementEvents": 9,
+        "SpStatementEvents": 91,
+        "PhysicalReadBytes": 0,
+        "PhysicalWrittenBytes": 36864,
+        "EndConnections": 7,
+        "EndActiveRequests": 0,
+        "WorkerCpuMs": 2110,
+        "EndWorkerWorkingSetBytes": 344670208,
+        "CompletedRequestsPerSecond": 6.657658499641532
+      },
+      "Load": {
+        "Seconds": 3.2905292,
+        "CompletedRequests": 3051,
+        "SqlStatementEvents": 1000,
+        "SpStatementEvents": 2781,
+        "PhysicalReadBytes": 0,
+        "PhysicalWrittenBytes": 3870720,
+        "EndConnections": 10,
+        "EndActiveRequests": 0,
+        "WorkerCpuMs": 3880,
+        "EndWorkerWorkingSetBytes": 457748480,
+        "CompletedRequestsPerSecond": 927.206480951453
+      },
+      "EnqueueSeconds": 1.7037495,
+      "JobsPerSecond": 61.460151849597175,
+      "BusinessLatencyP50Ms": 1540,
+      "BusinessLatencyP95Ms": 1656.667,
+      "BusinessLatencyP99Ms": 1680,
+      "Jobs": 200,
+      "DistinctExecutingNodes": 2,
+      "DuplicateBodies": 0
+    }
+  ]
+}

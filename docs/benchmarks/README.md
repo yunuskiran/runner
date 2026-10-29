@@ -2,7 +2,20 @@
 
 This is a reproducible SQL Server comparison tool, separate from Runner's application/runtime dependencies. It uses the **real Runner worker**, Hangfire.SqlServer and Quartz's persistent SQL Server store, with two independent worker processes per engine by default. It does not install Hangfire/Quartz into Runner or replace its scheduler.
 
-## Local exploratory snapshot
+## Matched settings: worker optimization results
+
+[Three-sample before/after table and CSV](optimization-2026-10-29.md) compare the existing worker with optimized revision `2d00787`, alongside fresh Hangfire/Quartz runs. Every case uses 200 jobs, a 10 ms body, two worker processes/eight slots each, 20 warm-up jobs, 35 seconds settling and 30 seconds idle measurement. All use the **responsive** profile; Runner's effective polling/lease/history settings are identical before and after. Engine order rotates across three full runs; before/after groups are interleaved. No other test/build runs overlap these timed windows. The hardware and SQL Server remain shared development resources.
+
+The observed Runner medians changed from **53.17 to 61.46 jobs/s (+15.6%)**, **20.990 to 15.245 completed load SQL requests/job (−27.4%)**, and **8.320 to 6.592 completed idle SQL requests/s (−20.8%)**. Business P95 medians were 1,550 ms before and 1,400 ms after, with overlapping sample ranges. All 2,400 measured bodies and durable completions were verified; no duplicates were observed.
+
+Hangfire still had higher median throughput (105.63 jobs/s), lower business P95 (753 ms) and fewer completed idle requests (5.457/s) than optimized Runner in this sample. Runner used about **46% fewer completed load SQL requests/job than Hangfire** (28.18), and **44% fewer than Quartz** (27.10). Quartz's throughput median was 57.16 jobs/s and its business P95 median was 1,237 ms. These measurements show specific tradeoffs; fewer requests do not establish lower SQL CPU, logical IO or total database cost. Histories/acquisition protocols differ as described below.
+
+![Runner optimization comparison with sample ranges](optimization-2026-10-29-responsive.svg)
+
+The bars show medians and whiskers show observed min–max, **not confidence intervals**. [Raw JSON](raw/), [run order](raw/optimization-run-order-2026-10-29.json) and [build provenance/checksums](raw/optimization-build-provenance-2026-10-29.json) are preserved. The before worker binary reports platform revision `2287330`; its Engine/Contracts source is unchanged by the original benchmark commit `5362ba0`. Both sides use the same benchmark adapter sources/pinned dependencies. The new code reduces candidate/body lookups, connection resets, attempt-finalization reads and empty scheduler/heartbeat requests; it retains lease fencing and durable journals. It does not change the default 30-second idle discovery cap or certify deployment capacity.
+
+## Earlier exploratory snapshot
+
 
 [Measured JSON/CSV/Markdown results](local-2026-10-29.md) cover 200 jobs, two worker processes with eight slots each, a 10 ms body and one sample per engine/profile. The SQL Server 2022 Developer instance and Linux hardware were shared development resources. This is not a multi-host deployment test or a peak-capacity claim. Defaults left only one node executing the short Runner/Quartz burst in this sample; the responsive profile used both. All bodies and durable completions were verified.
 

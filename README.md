@@ -4,7 +4,7 @@ A plugin-based durable worker with an operations dashboard, built with .NET 10 a
 
 **Status:** a tested foundation with cluster operations, isolated package/script execution and dependency workflows. Complete deployment-specific capacity, security and recovery validation before production rollout; local integration evidence is recorded in [validation](docs/validation.md).
 
-Compare real in-process worker engines with the [Runner / Hangfire / Quartz benchmark harness](docs/benchmarks/README.md). Its server-side SQL counters are separate from the older EF/API smoke measurements.
+Compare real in-process worker engines with the [Runner / Hangfire / Quartz benchmark harness](docs/benchmarks/README.md). Its server-side SQL counters are separate from the older EF/API smoke measurements. The [matched settings optimization report](docs/benchmarks/optimization-2026-10-29.md) records three samples per engine/revision, raw data and ranges.
 
 See [cluster operations and configuration](docs/platform.md) for server drain, manifest placement, OIDC/RBAC/audit, process isolation, queue limits, cron/time zones, workflows and database-cost controls. The [roadmap](docs/ROADMAP.md) records remaining limits.
 

@@ -1,0 +1,32 @@
+[
+  {
+    "stage": "before",
+    "engines": "runner",
+    "report": "docs/benchmarks/raw/optimization-before-1-2026-10-29.json"
+  },
+  {
+    "stage": "after",
+    "engines": "runner,hangfire,quartz",
+    "report": "docs/benchmarks/raw/optimization-after-1-2026-10-29.json"
+  },
+  {
+    "stage": "after",
+    "engines": "hangfire,quartz,runner",
+    "report": "docs/benchmarks/raw/optimization-after-2-2026-10-29.json"
+  },
+  {
+    "stage": "before",
+    "engines": "runner",
+    "report": "docs/benchmarks/raw/optimization-before-2-2026-10-29.json"
+  },
+  {
+    "stage": "before",
+    "engines": "runner",
+    "report": "docs/benchmarks/raw/optimization-before-3-2026-10-29.json"
+  },
+  {
+    "stage": "after",
+    "engines": "quartz,runner,hangfire",
+    "report": "docs/benchmarks/raw/optimization-after-3-2026-10-29.json"
+  }
+]
